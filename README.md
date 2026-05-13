@@ -46,3 +46,5 @@ Load this in Burp:
 ```text
 build/libs/UnusualFuzzer-0.1.0.jar
 ```
+
+Proudly Presented by ozozuz & jakbadwolf

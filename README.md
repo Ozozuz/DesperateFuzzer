@@ -28,7 +28,7 @@ plain -> base64 -> url
 Speed profiles are named scientifically:
 
 ```text
-giuseppe = 1 thread
+giuseppe = 1 thread (unstable - error prone)
 jacopo   = 3 threads
 giulio   = 5 threads
 ```

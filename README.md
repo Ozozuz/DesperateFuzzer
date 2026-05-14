@@ -13,13 +13,12 @@ So you fuzz the thing and hope the application explains itself by breaking.
 
 ## What It Does
 
-- Adds a `UnusualFuzzer` tab to Burp.
-- Adds `Send to Unusual Fuzzer` from Repeater.
-- Lets you mark request entry points and highlight them.
-- Sends raw, encoded, chained-encoded, or mutation-based payloads.
-- Sorts results by status and length.
-- Shows full request/response for every hit.
+- Turns "I have no more ideas" into 256 requests and a mild sense of purpose.
+- Sends raw, encoded, chained-encoded, or mutation-based payloads into whatever parameter looks guilty.
+- Lets you stack encodings until the backend starts questioning its career choices.
 - Highlights weird results, because apparently reading 256 almost-identical rows is a personality flaw.
+- Keeps the full request/response around, so your future self can still pretend this was a controlled experiment.
+- Mutation mode starts from something valid and makes it worse with confidence.
 
 Encoding chains are intentionally stackable:
 

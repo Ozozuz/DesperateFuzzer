@@ -9,7 +9,7 @@ Non ho altre idee.
 
 So you fuzz the thing and hope the application explains itself by breaking.
 
-![DesperateFuzzer trade offer meme](assets/desperate-fuzzer-meme.jpg)
+<img src="assets/desperate-fuzzer-meme.jpg" alt="DesperateFuzzer trade offer meme" width="320">
 
 ## What It Does
 

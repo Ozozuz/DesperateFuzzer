@@ -103,10 +103,10 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
         this.resultTableModel = new ResultTableModel();
         this.targetField = new JTextField("https://example.com", 34);
         this.speedProfileComboBox = new JComboBox<>(SpeedProfile.values());
-        this.encodingModeComboBox = new JComboBox<>(EncodingMode.values());
+        this.encodingModeComboBox = new JComboBox<>(EncodingMode.selectableModes());
         this.encodingPipelineModel = new DefaultListModel<>();
         this.encodingPipelineList = new JList<>(encodingPipelineModel);
-        this.encodingPipeline = new ArrayList<>(List.of(EncodingMode.PLAIN));
+        this.encodingPipeline = new ArrayList<>();
         this.runButton = new JButton("Run");
         this.mutationButton = new JButton("Run mutations");
         this.stopButton = new JButton("Stop");
@@ -276,12 +276,11 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
 
     private void clearEncodingPipeline() {
         encodingPipeline.clear();
-        encodingPipeline.add(EncodingMode.PLAIN);
         refreshEncodingPipeline();
     }
 
     private void removeLastEncodingFromPipeline() {
-        if (encodingPipeline.size() <= 1) {
+        if (encodingPipeline.isEmpty()) {
             return;
         }
 
@@ -1391,6 +1390,10 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
             }
 
             return values;
+        }
+
+        static EncodingMode[] selectableModes() {
+            return new EncodingMode[]{URL, HTML, UNICODE, BASE64};
         }
 
         static String display(int value) {

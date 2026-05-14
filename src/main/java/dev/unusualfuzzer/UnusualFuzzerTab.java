@@ -32,8 +32,14 @@ import javax.swing.ListSelectionModel;
 import javax.swing.SwingUtilities;
 import javax.swing.SwingWorker;
 import javax.swing.table.AbstractTableModel;
+import javax.swing.table.DefaultTableCellRenderer;
 import javax.swing.table.TableRowSorter;
+import javax.swing.text.BadLocationException;
+import javax.swing.text.DefaultHighlighter;
+import javax.swing.text.Highlighter;
+import javax.swing.text.JTextComponent;
 import java.awt.BorderLayout;
+import java.awt.Color;
 import java.awt.Component;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
@@ -45,10 +51,12 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Optional;
 import java.util.Random;
+import java.util.Set;
 import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ExecutionException;
@@ -80,6 +88,9 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
     private final JButton mutationButton;
     private final JButton stopButton;
     private final JLabel statusLabel;
+    private final List<Object> requestHighlightTags;
+    private final Set<String> loggedResultSignals;
+    private JTextComponent highlightedRequestComponent;
     private SwingWorker<List<FuzzResult>, FuzzResult> currentWorker;
 
     UnusualFuzzerTab(MontoyaApi api) {
@@ -100,6 +111,8 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
         this.mutationButton = new JButton("Run mutations");
         this.stopButton = new JButton("Stop");
         this.statusLabel = new JLabel("Select request text, then add at least one entry point");
+        this.requestHighlightTags = new ArrayList<>();
+        this.loggedResultSignals = new HashSet<>();
 
         stopButton.setEnabled(false);
         refreshEncodingPipeline();
@@ -180,6 +193,8 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
         JTable resultTable = new JTable(resultTableModel);
         resultTable.setAutoCreateRowSorter(true);
         resultTable.setRowSorter(new TableRowSorter<>(resultTableModel));
+        resultTable.setDefaultRenderer(Object.class, new ResultCellRenderer(resultTableModel));
+        resultTable.setDefaultRenderer(Integer.class, new ResultCellRenderer(resultTableModel));
         resultTable.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         resultTable.getSelectionModel().addListSelectionListener(event -> {
             if (!event.getValueIsAdjusting()) {
@@ -239,6 +254,9 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
         entryPointTableModel.add(new EntryPoint(range.startIndexInclusive(), range.endIndexExclusive(), selectedText));
         refreshRequestMarkers();
         setStatus("Entry point added: " + range.startIndexInclusive() + "-" + range.endIndexExclusive());
+        logToExtension("Entry point #" + entryPointTableModel.getRowCount()
+                + " added range=" + range.startIndexInclusive() + "-" + range.endIndexExclusive()
+                + " value=\"" + compactForLog(selectedText) + "\"");
     }
 
     private void clearEntryPoints() {
@@ -322,6 +340,7 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
         List<EncodingMode> activePipeline = List.copyOf(encodingPipeline);
         int valueCount = EncodingMode.valueCount();
         setStatus("Running " + (entryPoints.size() * valueCount) + " requests");
+        logScanStart("ASCII fuzz", targetService, entryPoints, speedProfile, activePipeline, entryPoints.size() * valueCount);
 
         currentWorker = new SwingWorker<>() {
             @Override
@@ -385,6 +404,7 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
             @Override
             protected void process(List<FuzzResult> chunks) {
                 resultTableModel.addAll(chunks);
+                logNewResultSignals();
                 setStatus("Sent " + resultTableModel.getRowCount() + " / " + (entryPoints.size() * valueCount));
             }
 
@@ -398,17 +418,22 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
                     int count = get().size();
                     if (isCancelled()) {
                         setStatus("Stopped: " + resultTableModel.getRowCount() + " requests sent");
+                        logToExtension("ASCII fuzz stopped results=" + resultTableModel.getRowCount());
                     } else {
                         setStatus("Completed: " + count + " requests sent");
+                        logToExtension("ASCII fuzz completed results=" + count);
                     }
                 } catch (InterruptedException exception) {
                     Thread.currentThread().interrupt();
                     setStatus("Interrupted");
+                    logToExtension("ASCII fuzz interrupted results=" + resultTableModel.getRowCount());
                 } catch (java.util.concurrent.CancellationException exception) {
                     setStatus("Stopped: " + resultTableModel.getRowCount() + " requests sent");
+                    logToExtension("ASCII fuzz stopped results=" + resultTableModel.getRowCount());
                 } catch (ExecutionException exception) {
                     api.logging().logToError(exception.toString());
                     setStatus("Failed: " + exception.getCause().getMessage());
+                    logToExtension("ASCII fuzz failed: " + exception.getCause().getMessage());
                 } finally {
                     currentWorker = null;
                 }
@@ -463,6 +488,7 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
         SpeedProfile speedProfile = (SpeedProfile) speedProfileComboBox.getSelectedItem();
         List<EncodingMode> activePipeline = List.copyOf(encodingPipeline);
         setStatus("Running " + totalRequests + " mutation requests");
+        logScanStart("Mutation fuzz", targetService, entryPoints, speedProfile, activePipeline, totalRequests);
 
         currentWorker = new SwingWorker<>() {
             @Override
@@ -523,6 +549,7 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
             @Override
             protected void process(List<FuzzResult> chunks) {
                 resultTableModel.addAll(chunks);
+                logNewResultSignals();
                 setStatus("Sent " + resultTableModel.getRowCount() + " / " + totalRequests);
             }
 
@@ -536,17 +563,22 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
                     int count = get().size();
                     if (isCancelled()) {
                         setStatus("Stopped: " + resultTableModel.getRowCount() + " requests sent");
+                        logToExtension("Mutation fuzz stopped results=" + resultTableModel.getRowCount());
                     } else {
                         setStatus("Completed: " + count + " mutation requests sent");
+                        logToExtension("Mutation fuzz completed results=" + count);
                     }
                 } catch (InterruptedException exception) {
                     Thread.currentThread().interrupt();
                     setStatus("Interrupted");
+                    logToExtension("Mutation fuzz interrupted results=" + resultTableModel.getRowCount());
                 } catch (java.util.concurrent.CancellationException exception) {
                     setStatus("Stopped: " + resultTableModel.getRowCount() + " requests sent");
+                    logToExtension("Mutation fuzz stopped results=" + resultTableModel.getRowCount());
                 } catch (ExecutionException exception) {
                     api.logging().logToError(exception.toString());
                     setStatus("Failed: " + exception.getCause().getMessage());
+                    logToExtension("Mutation fuzz failed: " + exception.getCause().getMessage());
                 } finally {
                     currentWorker = null;
                 }
@@ -560,6 +592,7 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
         if (currentWorker != null && !currentWorker.isDone()) {
             currentWorker.cancel(true);
             setStatus("Stopping...");
+            logToExtension("Scan stop requested after " + resultTableModel.getRowCount() + " results");
         }
     }
 
@@ -617,6 +650,7 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
 
     private void loadRequest(HttpRequest request) {
         SwingUtilities.invokeLater(() -> {
+            clearRequestEditorHighlights();
             requestEditor.setRequest(request.withMarkers(List.of()));
             targetField.setText(targetFromRequest(request));
             entryPointTableModel.clear();
@@ -628,12 +662,91 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
     private void refreshRequestMarkers() {
         HttpRequest currentRequest = requestEditor.getRequest();
         int requestLength = currentRequest.toString().length();
+        List<EntryPoint> entryPoints = entryPointTableModel.entryPoints();
         List<Marker> markers = entryPointTableModel.entryPoints().stream()
                 .filter(entryPoint -> entryPoint.startInclusive() >= 0 && entryPoint.endExclusive() <= requestLength)
                 .map(entryPoint -> Marker.marker(entryPoint.startInclusive(), entryPoint.endExclusive()))
                 .toList();
 
         requestEditor.setRequest(currentRequest.withMarkers(markers));
+        SwingUtilities.invokeLater(this::applyRequestEditorHighlights);
+
+        if (entryPoints.isEmpty()) {
+            updateRequestSearchExpression("");
+            return;
+        }
+
+        EntryPoint lastEntryPoint = entryPoints.get(entryPoints.size() - 1);
+        requestEditor.setCaretPosition(lastEntryPoint.startInclusive());
+        updateRequestSearchExpression(lastEntryPoint.selectedText());
+    }
+
+    private void updateRequestSearchExpression(String expression) {
+        try {
+            requestEditor.setSearchExpression(expression);
+        } catch (RuntimeException exception) {
+            api.logging().logToError("Unable to highlight entry point search expression: " + exception.getMessage());
+        }
+    }
+
+    private void applyRequestEditorHighlights() {
+        clearRequestEditorHighlights();
+        JTextComponent textComponent = findTextComponent(requestEditor.uiComponent());
+        if (textComponent == null) {
+            return;
+        }
+
+        highlightedRequestComponent = textComponent;
+        Highlighter highlighter = textComponent.getHighlighter();
+        DefaultHighlighter.DefaultHighlightPainter painter =
+                new DefaultHighlighter.DefaultHighlightPainter(new Color(255, 238, 128));
+        int documentLength = textComponent.getDocument().getLength();
+
+        for (EntryPoint entryPoint : entryPointTableModel.entryPoints()) {
+            if (entryPoint.startInclusive() < 0 || entryPoint.endExclusive() > documentLength) {
+                continue;
+            }
+
+            try {
+                Object tag = highlighter.addHighlight(entryPoint.startInclusive(), entryPoint.endExclusive(), painter);
+                requestHighlightTags.add(tag);
+            } catch (BadLocationException exception) {
+                api.logging().logToError("Unable to paint entry point highlight: " + exception.getMessage());
+            }
+        }
+    }
+
+    private void clearRequestEditorHighlights() {
+        if (highlightedRequestComponent == null) {
+            return;
+        }
+
+        Highlighter highlighter = highlightedRequestComponent.getHighlighter();
+        for (Object tag : requestHighlightTags) {
+            highlighter.removeHighlight(tag);
+        }
+
+        requestHighlightTags.clear();
+        highlightedRequestComponent = null;
+    }
+
+    private JTextComponent findTextComponent(Component component) {
+        if (component instanceof JTextComponent textComponent) {
+            return textComponent;
+        }
+
+        if (!(component instanceof java.awt.Container container)) {
+            return null;
+        }
+
+        for (Component child : container.getComponents()) {
+            JTextComponent textComponent = findTextComponent(child);
+            if (textComponent != null) {
+                return textComponent;
+            }
+        }
+
+        return null;
     }
 
     private String targetFromRequest(HttpRequest request) {
@@ -1084,8 +1197,80 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
 
     private void clearResults() {
         resultTableModel.clear();
+        loggedResultSignals.clear();
         resultRequestViewer.setRequest(HttpRequest.httpRequest(HttpService.httpService("example.com", 80, false), DEFAULT_REQUEST));
         resultResponseViewer.setResponse(httpResponse(""));
+    }
+
+    private void logScanStart(String scanType, HttpService targetService, List<EntryPoint> entryPoints,
+                              SpeedProfile speedProfile, List<EncodingMode> activePipeline, int totalRequests) {
+        logToExtension(scanType + " started target=" + targetFromService(targetService)
+                + " profile=\"" + speedProfile + "\""
+                + " encoding=\"" + encodingPipelineLabel(activePipeline) + "\""
+                + " entryPoints=" + entryPoints.size()
+                + " requests=" + totalRequests);
+
+        for (int index = 0; index < entryPoints.size(); index++) {
+            EntryPoint entryPoint = entryPoints.get(index);
+            logToExtension("Entry point #" + (index + 1)
+                    + " range=" + entryPoint.startInclusive() + "-" + entryPoint.endExclusive()
+                    + " seed=\"" + compactForLog(entryPoint.selectedText()) + "\"");
+        }
+    }
+
+    private void logNewResultSignals() {
+        for (int row = 0; row < resultTableModel.getRowCount(); row++) {
+            ResultSignal signal = resultTableModel.signalAt(row);
+            if (signal == ResultSignal.NORMAL) {
+                continue;
+            }
+
+            FuzzResult result = resultTableModel.resultAt(row);
+            String key = signal + "|" + result.entryPoint() + "|" + result.payload() + "|" + result.statusCode()
+                    + "|" + result.responseLength();
+
+            if (loggedResultSignals.add(key)) {
+                logToExtension(signal + " found entry=" + result.entryPoint()
+                        + " payload=\"" + compactForLog(result.payload()) + "\""
+                        + " status=" + result.statusCode()
+                        + " length=" + result.responseLength());
+            }
+        }
+    }
+
+    private String targetFromService(HttpService service) {
+        String scheme = service.secure() ? "https" : "http";
+        int defaultPort = defaultPort(service.secure());
+
+        if (service.port() == defaultPort) {
+            return scheme + "://" + service.host();
+        }
+
+        return scheme + "://" + service.host() + ":" + service.port();
+    }
+
+    private String encodingPipelineLabel(List<EncodingMode> pipeline) {
+        return pipeline.stream()
+                .map(EncodingMode::toString)
+                .reduce((left, right) -> left + " -> " + right)
+                .orElse("plain");
+    }
+
+    private String compactForLog(String value) {
+        String compact = value
+                .replace("\r", "\\r")
+                .replace("\n", "\\n")
+                .replace("\t", "\\t");
+
+        if (compact.length() > 120) {
+            return compact.substring(0, 117) + "...";
+        }
+
+        return compact;
+    }
+
+    private void logToExtension(String message) {
+        api.logging().logToOutput("[UnusualFuzzer] " + message);
     }
 
     private void setStatus(String message) {
@@ -1259,6 +1444,67 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
                               HttpRequestResponse requestResponse) {
     }
 
+    private enum ResultSignal {
+        NORMAL(""),
+        INTERESTING("interesting"),
+        OUTSIDER("outsider");
+
+        private final String label;
+
+        ResultSignal(String label) {
+            this.label = label;
+        }
+
+        @Override
+        public String toString() {
+            return label;
+        }
+    }
+
+    private static final class ResultCellRenderer extends DefaultTableCellRenderer {
+        private static final Color INTERESTING_BACKGROUND = new Color(255, 246, 204);
+        private static final Color OUTSIDER_BACKGROUND = new Color(136, 72, 72);
+        private static final Color SELECTED_INTERESTING_BACKGROUND = new Color(226, 202, 130);
+        private static final Color SELECTED_OUTSIDER_BACKGROUND = new Color(112, 64, 64);
+
+        private final ResultTableModel model;
+
+        private ResultCellRenderer(ResultTableModel model) {
+            this.model = model;
+        }
+
+        @Override
+        public Component getTableCellRendererComponent(JTable table, Object value, boolean isSelected, boolean hasFocus,
+                                                       int row, int column) {
+            Component component = super.getTableCellRendererComponent(table, value, isSelected, hasFocus, row, column);
+            int modelRow = table.convertRowIndexToModel(row);
+            ResultSignal signal = model.signalAt(modelRow);
+
+            if (isSelected) {
+                if (signal == ResultSignal.OUTSIDER) {
+                    component.setBackground(SELECTED_OUTSIDER_BACKGROUND);
+                } else if (signal == ResultSignal.INTERESTING) {
+                    component.setBackground(SELECTED_INTERESTING_BACKGROUND);
+                } else {
+                    component.setBackground(table.getSelectionBackground());
+                }
+                component.setForeground(table.getSelectionForeground());
+                return component;
+            }
+
+            if (signal == ResultSignal.OUTSIDER) {
+                component.setBackground(OUTSIDER_BACKGROUND);
+            } else if (signal == ResultSignal.INTERESTING) {
+                component.setBackground(INTERESTING_BACKGROUND);
+            } else {
+                component.setBackground(table.getBackground());
+            }
+            component.setForeground(table.getForeground());
+
+            return component;
+        }
+    }
+
     private static final class EntryPointTableModel extends AbstractTableModel {
         private static final String[] COLUMNS = {"#", "Start", "End", "Original"};
         private final List<EntryPoint> entryPoints = new ArrayList<>();
@@ -1312,7 +1558,10 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
     }
 
     private static final class ResultTableModel extends AbstractTableModel {
-        private static final String[] COLUMNS = {"Entry", "Payload", "Status", "Length"};
+        private static final String[] COLUMNS = {"Entry", "Payload", "Status", "Length", "Signal"};
+        private static final int MIN_RESULTS_FOR_SIGNAL = 8;
+        private static final int MIN_BASELINE_COUNT = 5;
+        private static final double BASELINE_RATIO = 0.55;
         private final List<FuzzResult> results = new ArrayList<>();
 
         void addAll(List<FuzzResult> newResults) {
@@ -1322,7 +1571,7 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
 
             int firstRow = results.size();
             results.addAll(newResults);
-            fireTableRowsInserted(firstRow, results.size() - 1);
+            fireTableDataChanged();
         }
 
         void clear() {
@@ -1336,6 +1585,75 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
 
         FuzzResult resultAt(int row) {
             return results.get(row);
+        }
+
+        ResultSignal signalAt(int row) {
+            if (row < 0 || row >= results.size() || results.size() < MIN_RESULTS_FOR_SIGNAL) {
+                return ResultSignal.NORMAL;
+            }
+
+            FuzzResult baseline = baselineResult();
+            if (baseline == null) {
+                return ResultSignal.NORMAL;
+            }
+
+            FuzzResult result = results.get(row);
+            if (result.statusCode() != baseline.statusCode()) {
+                return ResultSignal.OUTSIDER;
+            }
+
+            int distance = Math.abs(result.responseLength() - baseline.responseLength());
+            int outsiderThreshold = Math.max(100, (int) Math.round(baseline.responseLength() * 0.35));
+            int interestingThreshold = Math.max(50, (int) Math.round(baseline.responseLength() * 0.20));
+
+            if (distance >= outsiderThreshold) {
+                return ResultSignal.OUTSIDER;
+            }
+
+            if (distance >= interestingThreshold) {
+                return ResultSignal.INTERESTING;
+            }
+
+            return ResultSignal.NORMAL;
+        }
+
+        private FuzzResult baselineResult() {
+            LinkedHashMap<ResultBucket, Integer> counts = new LinkedHashMap<>();
+
+            for (FuzzResult result : results) {
+                ResultBucket bucket = ResultBucket.from(result);
+                counts.merge(bucket, 1, Integer::sum);
+            }
+
+            ResultBucket baselineBucket = null;
+            int baselineCount = 0;
+
+            for (var entry : counts.entrySet()) {
+                if (entry.getValue() > baselineCount) {
+                    baselineBucket = entry.getKey();
+                    baselineCount = entry.getValue();
+                }
+            }
+
+            if (baselineBucket == null || baselineCount < MIN_BASELINE_COUNT
+                    || baselineCount < Math.ceil(results.size() * BASELINE_RATIO)) {
+                return null;
+            }
+
+            int bestDistance = Integer.MAX_VALUE;
+            FuzzResult baseline = null;
+
+            for (FuzzResult result : results) {
+                if (baselineBucket.equals(ResultBucket.from(result))) {
+                    int distance = Math.abs(result.responseLength() - baselineBucket.lengthCenter());
+                    if (distance < bestDistance) {
+                        bestDistance = distance;
+                        baseline = result;
+                    }
+                }
+            }
+
+            return baseline;
         }
 
         @Override
@@ -1370,8 +1688,17 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
                 case 1 -> result.payload();
                 case 2 -> result.statusCode();
                 case 3 -> result.responseLength();
+                case 4 -> signalAt(rowIndex).toString();
                 default -> "";
             };
+        }
+
+        private record ResultBucket(int statusCode, int lengthCenter) {
+            private static ResultBucket from(FuzzResult result) {
+                int bucketSize = Math.max(25, Math.max(1, result.responseLength() / 10));
+                int lengthCenter = Math.round((float) result.responseLength() / bucketSize) * bucketSize;
+                return new ResultBucket(result.statusCode(), lengthCenter);
+            }
         }
     }
 }

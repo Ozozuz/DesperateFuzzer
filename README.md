@@ -1,4 +1,4 @@
-# UnusualFuzzer
+# DesperateFuzzer
 
 Burp Suite extension for the noble moment when the methodology reaches:
 
@@ -17,6 +17,7 @@ So you fuzz the thing and hope the application explains itself by breaking.
 - Sends raw, encoded, chained-encoded, or mutation-based payloads.
 - Sorts results by status and length.
 - Shows full request/response for every hit.
+- Highlights weird results, because apparently reading 256 almost-identical rows is a personality flaw.
 
 Encoding chains are intentionally stackable:
 
@@ -28,7 +29,7 @@ plain -> base64 -> url
 Speed profiles are named scientifically:
 
 ```text
-giuseppe = 1 thread (unstable - error prone)
+giuseppe = 1 thread
 jacopo   = 3 threads
 giulio   = 5 threads
 ```
@@ -44,7 +45,5 @@ Requires JDK 17+ and `lib/montoya-api-2026.4.jar`.
 Load this in Burp:
 
 ```text
-build/libs/UnusualFuzzer-0.1.0.jar
+build/libs/UnusualFuzzer-0.2.0.jar
 ```
-
-Proudly Presented by ozozuz & jakbadwolf

@@ -2,13 +2,10 @@ package dev.unusualfuzzer;
 
 import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.core.ByteArray;
-import burp.api.montoya.core.Marker;
-import burp.api.montoya.core.Range;
 import burp.api.montoya.core.ToolType;
 import burp.api.montoya.http.HttpService;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
-import burp.api.montoya.ui.Selection;
 import burp.api.montoya.ui.contextmenu.ContextMenuEvent;
 import burp.api.montoya.ui.contextmenu.ContextMenuItemsProvider;
 import burp.api.montoya.ui.editor.EditorOptions;
@@ -26,6 +23,7 @@ import javax.swing.JScrollPane;
 import javax.swing.JSplitPane;
 import javax.swing.JTabbedPane;
 import javax.swing.JTable;
+import javax.swing.JTextArea;
 import javax.swing.JTextField;
 import javax.swing.JMenuItem;
 import javax.swing.ListSelectionModel;
@@ -37,11 +35,11 @@ import javax.swing.table.TableRowSorter;
 import javax.swing.text.BadLocationException;
 import javax.swing.text.DefaultHighlighter;
 import javax.swing.text.Highlighter;
-import javax.swing.text.JTextComponent;
 import java.awt.BorderLayout;
 import java.awt.Color;
 import java.awt.Component;
 import java.awt.Dimension;
+import java.awt.Font;
 import java.awt.FlowLayout;
 import java.awt.GridLayout;
 import java.net.URI;
@@ -68,12 +66,13 @@ import static burp.api.montoya.http.message.requests.HttpRequest.httpRequest;
 import static burp.api.montoya.http.message.responses.HttpResponse.httpResponse;
 
 final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider {
+    private static final long serialVersionUID = 1L;
     private static final String DEFAULT_REQUEST = "GET /?q=FUZZ HTTP/1.1\r\nHost: example.com\r\n\r\n";
     private static final Pattern CONTENT_LENGTH_PATTERN = Pattern.compile("(?im)^Content-Length:[ \\t]*\\d+[ \\t]*$");
     private static final int MAX_MUTATION_CASES_PER_ENTRY_POINT = 512;
 
     private final MontoyaApi api;
-    private final HttpRequestEditor requestEditor;
+    private final JTextArea requestTextArea;
     private final HttpRequestEditor resultRequestViewer;
     private final HttpResponseEditor resultResponseViewer;
     private final EntryPointTableModel entryPointTableModel;
@@ -90,13 +89,12 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
     private final JLabel statusLabel;
     private final List<Object> requestHighlightTags;
     private final Set<String> loggedResultSignals;
-    private JTextComponent highlightedRequestComponent;
     private SwingWorker<List<FuzzResult>, FuzzResult> currentWorker;
 
     UnusualFuzzerTab(MontoyaApi api) {
         super(new BorderLayout(8, 8));
         this.api = api;
-        this.requestEditor = api.userInterface().createHttpRequestEditor();
+        this.requestTextArea = new JTextArea(DEFAULT_REQUEST);
         this.resultRequestViewer = api.userInterface().createHttpRequestEditor(EditorOptions.READ_ONLY);
         this.resultResponseViewer = api.userInterface().createHttpResponseEditor(EditorOptions.READ_ONLY);
         this.entryPointTableModel = new EntryPointTableModel();
@@ -116,12 +114,18 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
 
         stopButton.setEnabled(false);
         refreshEncodingPipeline();
-        requestEditor.setRequest(HttpRequest.httpRequest(HttpService.httpService("example.com", 80, false), DEFAULT_REQUEST));
+        configureRequestTextArea();
 
         setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
         add(buildToolbar(), BorderLayout.NORTH);
         add(buildMainPanel(), BorderLayout.CENTER);
         add(buildStatusPanel(), BorderLayout.SOUTH);
+    }
+
+    private void configureRequestTextArea() {
+        requestTextArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 13));
+        requestTextArea.setLineWrap(false);
+        requestTextArea.setTabSize(4);
     }
 
     private JPanel buildToolbar() {
@@ -219,7 +223,10 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
         tableSplit.setBottomComponent(resultScroll);
         tableSplit.setResizeWeight(0.18);
 
-        topSplit.setLeftComponent(requestEditor.uiComponent());
+        JScrollPane requestScroll = new JScrollPane(requestTextArea);
+        requestScroll.setBorder(BorderFactory.createTitledBorder("Request"));
+
+        topSplit.setLeftComponent(requestScroll);
         topSplit.setRightComponent(tableSplit);
         topSplit.setResizeWeight(0.68);
 
@@ -237,25 +244,36 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
     }
 
     private void addSelectedEntryPoint() {
-        Optional<Selection> selection = requestEditor.selection();
+        int start = requestTextArea.getSelectionStart();
+        int end = requestTextArea.getSelectionEnd();
 
-        if (selection.isEmpty()) {
+        if (start < 0 || end < 0) {
             setStatus("No selection: select the insertion point in the request editor");
             return;
         }
 
-        Range range = selection.get().offsets();
-        if (range.startIndexInclusive() == range.endIndexExclusive()) {
+        if (start == end) {
             setStatus("Empty selection: select at least one byte");
             return;
         }
 
-        String selectedText = selection.get().contents().toString();
-        entryPointTableModel.add(new EntryPoint(range.startIndexInclusive(), range.endIndexExclusive(), selectedText));
+        String selectedText = requestTextArea.getSelectedText();
+        Optional<EntryPoint> overlappingEntryPoint = entryPointTableModel.overlappingEntryPoint(start, end);
+        if (overlappingEntryPoint.isPresent()) {
+            EntryPoint existingEntryPoint = overlappingEntryPoint.get();
+            setStatus("Overlapping entry point ignored: " + start + "-" + end
+                    + " overlaps " + existingEntryPoint.startInclusive() + "-" + existingEntryPoint.endExclusive());
+            logToExtension("Overlapping entry point ignored range=" + start + "-" + end
+                    + " overlaps=" + existingEntryPoint.startInclusive() + "-" + existingEntryPoint.endExclusive()
+                    + " value=\"" + compactForLog(selectedText) + "\"");
+            return;
+        }
+
+        entryPointTableModel.add(new EntryPoint(start, end, selectedText));
         refreshRequestMarkers();
-        setStatus("Entry point added: " + range.startIndexInclusive() + "-" + range.endIndexExclusive());
+        setStatus("Entry point added: " + start + "-" + end);
         logToExtension("Entry point #" + entryPointTableModel.getRowCount()
-                + " added range=" + range.startIndexInclusive() + "-" + range.endIndexExclusive()
+                + " added range=" + start + "-" + end
                 + " value=\"" + compactForLog(selectedText) + "\"");
     }
 
@@ -311,8 +329,7 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
             return;
         }
 
-        HttpRequest baseRequest = requestEditor.getRequest();
-        String rawRequest = baseRequest.toString();
+        String rawRequest = requestTextArea.getText();
         HttpService targetService;
 
         try {
@@ -322,12 +339,10 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
             return;
         }
 
-        Optional<EntryPoint> invalidEntryPoint = entryPoints.stream()
-                .filter(entryPoint -> entryPoint.endExclusive() > rawRequest.length())
-                .findFirst();
+        Optional<EntryPoint> invalidEntryPoint = invalidEntryPoint(rawRequest, entryPoints);
 
         if (invalidEntryPoint.isPresent()) {
-            setStatus("Entry point outside current request. Clear and add it again.");
+            setStatus("Entry point changed or outside current request. Clear and add it again.");
             return;
         }
 
@@ -449,8 +464,7 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
             return;
         }
 
-        HttpRequest baseRequest = requestEditor.getRequest();
-        String rawRequest = baseRequest.toString();
+        String rawRequest = requestTextArea.getText();
         HttpService targetService;
 
         try {
@@ -460,12 +474,10 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
             return;
         }
 
-        Optional<EntryPoint> invalidEntryPoint = entryPoints.stream()
-                .filter(entryPoint -> entryPoint.endExclusive() > rawRequest.length())
-                .findFirst();
+        Optional<EntryPoint> invalidEntryPoint = invalidEntryPoint(rawRequest, entryPoints);
 
         if (invalidEntryPoint.isPresent()) {
-            setStatus("Entry point outside current request. Clear and add it again.");
+            setStatus("Entry point changed or outside current request. Clear and add it again.");
             return;
         }
 
@@ -628,7 +640,7 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
             return List.of();
         }
 
-        JMenuItem menuItem = new JMenuItem("Send to Unusual Fuzzer");
+        JMenuItem menuItem = new JMenuItem("Send to DesperateFuzzer");
         menuItem.addActionListener(action -> loadRequest(request.get()));
 
         return List.of(menuItem);
@@ -650,7 +662,8 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
     private void loadRequest(HttpRequest request) {
         SwingUtilities.invokeLater(() -> {
             clearRequestEditorHighlights();
-            requestEditor.setRequest(request.withMarkers(List.of()));
+            requestTextArea.setText(request.toString());
+            requestTextArea.setCaretPosition(0);
             targetField.setText(targetFromRequest(request));
             entryPointTableModel.clear();
             clearResults();
@@ -659,47 +672,26 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
     }
 
     private void refreshRequestMarkers() {
-        HttpRequest currentRequest = requestEditor.getRequest();
-        int requestLength = currentRequest.toString().length();
+        int requestLength = requestTextArea.getText().length();
         List<EntryPoint> entryPoints = entryPointTableModel.entryPoints();
-        List<Marker> markers = entryPointTableModel.entryPoints().stream()
-                .filter(entryPoint -> entryPoint.startInclusive() >= 0 && entryPoint.endExclusive() <= requestLength)
-                .map(entryPoint -> Marker.marker(entryPoint.startInclusive(), entryPoint.endExclusive()))
-                .toList();
-
-        requestEditor.setRequest(currentRequest.withMarkers(markers));
         SwingUtilities.invokeLater(this::applyRequestEditorHighlights);
 
         if (entryPoints.isEmpty()) {
-            updateRequestSearchExpression("");
             return;
         }
 
         EntryPoint lastEntryPoint = entryPoints.get(entryPoints.size() - 1);
-        requestEditor.setCaretPosition(lastEntryPoint.startInclusive());
-        updateRequestSearchExpression(lastEntryPoint.selectedText());
-    }
-
-    private void updateRequestSearchExpression(String expression) {
-        try {
-            requestEditor.setSearchExpression(expression);
-        } catch (RuntimeException exception) {
-            api.logging().logToError("Unable to highlight entry point search expression: " + exception.getMessage());
+        if (lastEntryPoint.startInclusive() >= 0 && lastEntryPoint.startInclusive() <= requestLength) {
+            requestTextArea.setCaretPosition(lastEntryPoint.startInclusive());
         }
     }
 
     private void applyRequestEditorHighlights() {
         clearRequestEditorHighlights();
-        JTextComponent textComponent = findTextComponent(requestEditor.uiComponent());
-        if (textComponent == null) {
-            return;
-        }
-
-        highlightedRequestComponent = textComponent;
-        Highlighter highlighter = textComponent.getHighlighter();
+        Highlighter highlighter = requestTextArea.getHighlighter();
         DefaultHighlighter.DefaultHighlightPainter painter =
                 new DefaultHighlighter.DefaultHighlightPainter(new Color(255, 238, 128));
-        int documentLength = textComponent.getDocument().getLength();
+        int documentLength = requestTextArea.getDocument().getLength();
 
         for (EntryPoint entryPoint : entryPointTableModel.entryPoints()) {
             if (entryPoint.startInclusive() < 0 || entryPoint.endExclusive() > documentLength) {
@@ -716,36 +708,12 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
     }
 
     private void clearRequestEditorHighlights() {
-        if (highlightedRequestComponent == null) {
-            return;
-        }
-
-        Highlighter highlighter = highlightedRequestComponent.getHighlighter();
+        Highlighter highlighter = requestTextArea.getHighlighter();
         for (Object tag : requestHighlightTags) {
             highlighter.removeHighlight(tag);
         }
 
         requestHighlightTags.clear();
-        highlightedRequestComponent = null;
-    }
-
-    private JTextComponent findTextComponent(Component component) {
-        if (component instanceof JTextComponent textComponent) {
-            return textComponent;
-        }
-
-        if (!(component instanceof java.awt.Container container)) {
-            return null;
-        }
-
-        for (Component child : container.getComponents()) {
-            JTextComponent textComponent = findTextComponent(child);
-            if (textComponent != null) {
-                return textComponent;
-            }
-        }
-
-        return null;
     }
 
     private String targetFromRequest(HttpRequest request) {
@@ -841,6 +809,14 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
 
     private int defaultPort(boolean secure) {
         return secure ? 443 : 80;
+    }
+
+    private Optional<EntryPoint> invalidEntryPoint(String rawRequest, List<EntryPoint> entryPoints) {
+        return entryPoints.stream()
+                .filter(entryPoint -> entryPoint.endExclusive() > rawRequest.length()
+                        || !rawRequest.substring(entryPoint.startInclusive(), entryPoint.endExclusive())
+                        .equals(entryPoint.selectedText()))
+                .findFirst();
     }
 
     private byte[] seedBytes(String rawRequest, EntryPoint entryPoint) {
@@ -1269,7 +1245,7 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
     }
 
     private void logToExtension(String message) {
-        api.logging().logToOutput("[UnusualFuzzer] " + message);
+        api.logging().logToOutput("[DesperateFuzzer] " + message);
     }
 
     private void setStatus(String message) {
@@ -1294,9 +1270,9 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
     }
 
     private enum SpeedProfile {
-        GIUSEPPE("giuseppe [1 thread]", 1),
-        JACOPO("jacopo [3 threads]", 3),
-        GIULIO("giulio [5 threads]", 5);
+        GIUSEPPE("giuseppe [2 threads]", 2),
+        JACOPO("jacopo [6 threads]", 6),
+        GIULIO("giulio [10 threads]", 10);
 
         private final String label;
         private final int threadCount;
@@ -1465,6 +1441,7 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
     }
 
     private static final class ResultCellRenderer extends DefaultTableCellRenderer {
+        private static final long serialVersionUID = 1L;
         private static final Color INTERESTING_BACKGROUND = new Color(255, 246, 204);
         private static final Color OUTSIDER_BACKGROUND = new Color(136, 72, 72);
         private static final Color SELECTED_INTERESTING_BACKGROUND = new Color(226, 202, 130);
@@ -1509,6 +1486,7 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
     }
 
     private static final class EntryPointTableModel extends AbstractTableModel {
+        private static final long serialVersionUID = 1L;
         private static final String[] COLUMNS = {"#", "Start", "End", "Original"};
         private final List<EntryPoint> entryPoints = new ArrayList<>();
 
@@ -1529,6 +1507,13 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
 
         List<EntryPoint> entryPoints() {
             return List.copyOf(entryPoints);
+        }
+
+        Optional<EntryPoint> overlappingEntryPoint(int startInclusive, int endExclusive) {
+            return entryPoints.stream()
+                    .filter(entryPoint -> startInclusive < entryPoint.endExclusive()
+                            && endExclusive > entryPoint.startInclusive())
+                    .findFirst();
         }
 
         @Override
@@ -1561,6 +1546,7 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
     }
 
     private static final class ResultTableModel extends AbstractTableModel {
+        private static final long serialVersionUID = 1L;
         private static final String[] COLUMNS = {"Entry", "Payload", "Status", "Length", "Signal"};
         private static final int MIN_RESULTS_FOR_SIGNAL = 8;
         private static final int MIN_BASELINE_COUNT = 5;

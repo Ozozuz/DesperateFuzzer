@@ -23,16 +23,17 @@ So you fuzz the thing and hope the application explains itself by breaking.
 Encoding chains are intentionally stackable:
 
 ```text
-plain -> url -> url
-plain -> base64 -> url
+empty pipeline = plain/raw
+url -> url
+base64 -> url
 ```
 
 Speed profiles are named scientifically:
 
 ```text
-giuseppe = 1 thread
-jacopo   = 3 threads
-giulio   = 5 threads
+giuseppe = 2 threads
+jacopo   = 6 threads
+giulio   = 10 threads
 ```
 
 ## Build

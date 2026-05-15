@@ -4,7 +4,7 @@ import burp.api.montoya.BurpExtension;
 import burp.api.montoya.MontoyaApi;
 
 public final class UnusualFuzzerExtension implements BurpExtension {
-    private static final String EXTENSION_NAME = "UnusualFuzzer";
+    private static final String EXTENSION_NAME = "DesperateFuzzer";
 
     @Override
     public void initialize(MontoyaApi api) {

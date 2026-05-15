@@ -1,0 +1,32 @@
+plugins {
+    id "java"
+}
+
+group = "dev.unusualfuzzer"
+version = "0.2.0"
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+}
+
+dependencies {
+    compileOnly "net.portswigger.burp.extensions:montoya-api:2026.4"
+
+    testImplementation platform("org.junit:junit-bom:5.10.2")
+    testImplementation "org.junit.jupiter:junit-jupiter"
+    testImplementation "net.portswigger.burp.extensions:montoya-api:2026.4"
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = "UTF-8"
+}
+
+tasks.jar {
+    archiveBaseName.set("UnusualFuzzer")
+}
+
+test {
+    useJUnitPlatform()
+}

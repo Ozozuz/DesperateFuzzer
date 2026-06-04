@@ -2,8 +2,12 @@ package dev.desperatefuzzer;
 
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -75,5 +79,90 @@ class DesperateFuzzerExtensionTest {
         for (int index = 0; index < expectedBody.length; index++) {
             assertEquals(expectedBody[index], updatedRequest[bodyOffset + index]);
         }
+    }
+
+    @Test
+    void lengthOutlierIsSignaledWithinSameEntryAndStatus() throws Exception {
+        Object model = newResultTableModel();
+        List<Object> rows = new ArrayList<>();
+
+        for (int index = 0; index < 9; index++) {
+            rows.add(fuzzResult(1, "base" + index, 200, 1000 + (index % 3)));
+        }
+        rows.add(fuzzResult(1, "high", 200, 1600));
+
+        addResults(model, rows);
+
+        assertEquals("", signalAt(model, 0));
+        assertEquals("outsider", signalAt(model, 9));
+    }
+
+    @Test
+    void rareStatusIsSignaledWithinEntryPoint() throws Exception {
+        Object model = newResultTableModel();
+        List<Object> rows = new ArrayList<>();
+
+        for (int index = 0; index < 20; index++) {
+            rows.add(fuzzResult(1, "ok" + index, 200, 1000));
+        }
+        rows.add(fuzzResult(1, "rare", 500, 0));
+
+        addResults(model, rows);
+
+        assertEquals("", signalAt(model, 0));
+        assertEquals("outsider", signalAt(model, 20));
+    }
+
+    @Test
+    void lengthOutlierIsSignaledInsideNonDominantStatusGroup() throws Exception {
+        Object model = newResultTableModel();
+        List<Object> rows = new ArrayList<>();
+
+        for (int index = 0; index < 30; index++) {
+            rows.add(fuzzResult(1, "ok" + index, 200, 1000));
+        }
+        for (int index = 0; index < 6; index++) {
+            rows.add(fuzzResult(1, "redirect" + index, 302, 0));
+        }
+        rows.add(fuzzResult(1, "redirect-body", 302, 500));
+
+        addResults(model, rows);
+
+        assertEquals("", signalAt(model, 30));
+        assertEquals("outsider", signalAt(model, 36));
+    }
+
+    private static Object newResultTableModel() throws Exception {
+        Class<?> modelClass = Class.forName("dev.desperatefuzzer.DesperateFuzzerTab$ResultTableModel");
+        Constructor<?> constructor = modelClass.getDeclaredConstructor();
+        constructor.setAccessible(true);
+        return constructor.newInstance();
+    }
+
+    private static Object fuzzResult(int entryPoint, String payload, int statusCode, int responseLength)
+            throws Exception {
+        Class<?> resultClass = Class.forName("dev.desperatefuzzer.DesperateFuzzerTab$FuzzResult");
+        Constructor<?> constructor = resultClass.getDeclaredConstructor(
+                int.class,
+                String.class,
+                int.class,
+                int.class,
+                String.class,
+                Class.forName("burp.api.montoya.http.message.HttpRequestResponse")
+        );
+        constructor.setAccessible(true);
+        return constructor.newInstance(entryPoint, payload, statusCode, responseLength, "", null);
+    }
+
+    private static void addResults(Object model, List<Object> rows) throws Exception {
+        Method method = model.getClass().getDeclaredMethod("addAll", List.class);
+        method.setAccessible(true);
+        method.invoke(model, rows);
+    }
+
+    private static String signalAt(Object model, int row) throws Exception {
+        Method method = model.getClass().getDeclaredMethod("signalAt", int.class);
+        method.setAccessible(true);
+        return String.valueOf(method.invoke(model, row));
     }
 }

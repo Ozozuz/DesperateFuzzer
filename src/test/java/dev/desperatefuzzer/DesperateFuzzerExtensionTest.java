@@ -132,6 +132,39 @@ class DesperateFuzzerExtensionTest {
         assertEquals("outsider", signalAt(model, 36));
     }
 
+    @Test
+    void errorSignatureMatchFindsSpecificLeaks() {
+        assertEquals("Oracle ORA", DesperateFuzzerTab.errorSignatureMatch("SQL failed: ORA-00933 near token"));
+        assertEquals("Java stack trace", DesperateFuzzerTab.errorSignatureMatch("\tat com.example.App.main(App.java:42)"));
+        assertEquals("", DesperateFuzzerTab.errorSignatureMatch("normal application response"));
+    }
+
+    @Test
+    void errorMatchPromotesResultToInterestingWithoutBaseline() throws Exception {
+        Object model = newResultTableModel();
+
+        addResults(model, List.of(fuzzResult(1, "quote", 200, 1000, "Oracle ORA")));
+
+        assertEquals("interesting", signalAt(model, 0));
+        assertEquals("Oracle ORA", valueAt(model, 0, 5));
+    }
+
+    @Test
+    void errorMatchDoesNotDowngradeOutsiderSignal() throws Exception {
+        Object model = newResultTableModel();
+        List<Object> rows = new ArrayList<>();
+
+        for (int index = 0; index < 9; index++) {
+            rows.add(fuzzResult(1, "base" + index, 200, 1000));
+        }
+        rows.add(fuzzResult(1, "stack", 200, 1600, "Java stack trace"));
+
+        addResults(model, rows);
+
+        assertEquals("outsider", signalAt(model, 9));
+        assertEquals("Java stack trace", valueAt(model, 9, 5));
+    }
+
     private static Object newResultTableModel() throws Exception {
         Class<?> modelClass = Class.forName("dev.desperatefuzzer.DesperateFuzzerTab$ResultTableModel");
         Constructor<?> constructor = modelClass.getDeclaredConstructor();
@@ -141,6 +174,11 @@ class DesperateFuzzerExtensionTest {
 
     private static Object fuzzResult(int entryPoint, String payload, int statusCode, int responseLength)
             throws Exception {
+        return fuzzResult(entryPoint, payload, statusCode, responseLength, "");
+    }
+
+    private static Object fuzzResult(int entryPoint, String payload, int statusCode, int responseLength, String match)
+            throws Exception {
         Class<?> resultClass = Class.forName("dev.desperatefuzzer.DesperateFuzzerTab$FuzzResult");
         Constructor<?> constructor = resultClass.getDeclaredConstructor(
                 int.class,
@@ -148,10 +186,11 @@ class DesperateFuzzerExtensionTest {
                 int.class,
                 int.class,
                 String.class,
+                String.class,
                 Class.forName("burp.api.montoya.http.message.HttpRequestResponse")
         );
         constructor.setAccessible(true);
-        return constructor.newInstance(entryPoint, payload, statusCode, responseLength, "", null);
+        return constructor.newInstance(entryPoint, payload, statusCode, responseLength, match, "", null);
     }
 
     private static void addResults(Object model, List<Object> rows) throws Exception {
@@ -164,5 +203,10 @@ class DesperateFuzzerExtensionTest {
         Method method = model.getClass().getDeclaredMethod("signalAt", int.class);
         method.setAccessible(true);
         return String.valueOf(method.invoke(model, row));
+    }
+
+    private static Object valueAt(Object model, int row, int column) throws Exception {
+        Method method = model.getClass().getMethod("getValueAt", int.class, int.class);
+        return method.invoke(model, row, column);
     }
 }

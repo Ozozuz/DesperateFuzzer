@@ -36,6 +36,18 @@ jacopo   = 6 threads
 giulio   = 10 threads
 ```
 
+## How Signals Are Chosen
+
+The `Signal` column exists because scrolling through hundreds of identical-looking responses is not a personality test anyone should have to pass.
+
+Every result starts as normal. Then DesperateFuzzer gets suspicious in three ways:
+
+- **Status rarity**: results are grouped by entry point, then by HTTP status. A lonely `500` in a sea of `200`s is an `outsider`; a small but not microscopic status group is `interesting`. Revolutionary concept: different status codes may mean different things.
+- **Length drift**: lengths are compared only inside the same entry point and same status group. A weird `200` is compared with other `200`s, not with redirects, because chaos is not a baseline. Big body-size deviations become `outsider`; moderate ones become `interesting`.
+- **Error signatures**: the response body is grepped for boringly useful leaks like `ORA-00933`, `SQLSTATE`, Java/Python/.NET/PHP stack traces, Spring internals, Go panics, and debug-page classics. A match promotes the row to at least `interesting`, because if the app prints a stack trace, it is probably trying to confess.
+
+The `Match` column shows which explicit error/debug signature was found. This never downgrades a stronger signal: if a row is already an `outsider`, finding a stack trace does not politely demote it to "mildly spicy".
+
 ## Build
 
 Requires JDK 17+ and `lib/montoya-api-2026.4.jar`.

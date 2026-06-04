@@ -48,10 +48,12 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Random;
 import java.util.Set;
@@ -71,6 +73,7 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
     private static final long serialVersionUID = 1L;
     private static final String DEFAULT_REQUEST = "GET /?q=FUZZ HTTP/1.1\r\nHost: example.com\r\n\r\n";
     private static final Pattern CONTENT_LENGTH_PATTERN = Pattern.compile("(?im)^Content-Length:[ \\t]*\\d+[ \\t]*$");
+    private static final Map<String, Pattern> ERROR_SIGNATURES = errorSignatures();
     private static final int MAX_MUTATION_CASES_PER_ENTRY_POINT = 512;
     private static final int BOUNDARY_MUTATION_QUOTA = 32;
     private static final int BIT_FLIP_MUTATION_QUOTA = 112;
@@ -555,19 +558,22 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
             HttpRequestResponse requestResponse = api.http().sendRequest(request);
 
             if (!requestResponse.hasResponse()) {
-                return new FuzzResult(entryPoint, payload, 0, 0, "No response", requestResponse);
+                return new FuzzResult(entryPoint, payload, 0, 0, "", "No response", requestResponse);
             }
+
+            String errorMatch = errorSignatureMatch(requestResponse.response().bodyToString());
 
             return new FuzzResult(
                     entryPoint,
                     payload,
                     requestResponse.response().statusCode(),
                     requestResponse.response().body().length(),
+                    errorMatch,
                     "",
                     requestResponse
             );
         } catch (RuntimeException exception) {
-            return new FuzzResult(entryPoint, payload, 0, 0, exception.getMessage(), null);
+            return new FuzzResult(entryPoint, payload, 0, 0, "", exceptionMessage(exception), null);
         }
     }
 
@@ -1213,13 +1219,14 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
 
         FuzzResult result = resultTableModel.resultAt(row);
         String key = signal + "|" + result.entryPoint() + "|" + result.payload() + "|" + result.statusCode()
-                + "|" + result.responseLength();
+                + "|" + result.responseLength() + "|" + result.match();
 
         if (loggedResultSignals.add(key)) {
             logToExtension(signal + " found entry=" + result.entryPoint()
                     + " payload=\"" + compactForLog(result.payload()) + "\""
                     + " status=" + result.statusCode()
-                    + " length=" + result.responseLength());
+                    + " length=" + result.responseLength()
+                    + (result.match().isBlank() ? "" : " match=\"" + compactForLog(result.match()) + "\""));
         }
     }
 
@@ -1256,6 +1263,61 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
 
     private void logToExtension(String message) {
         api.logging().logToOutput("[DesperateFuzzer] " + message);
+    }
+
+    private static Map<String, Pattern> errorSignatures() {
+        LinkedHashMap<String, Pattern> signatures = new LinkedHashMap<>();
+
+        addErrorSignature(signatures, "SQLSTATE", "\\bSQLSTATE(?:\\[[^\\]]+\\])?\\b");
+        addErrorSignature(signatures, "Oracle ORA", "\\bORA-\\d{5}\\b");
+        addErrorSignature(signatures, "PostgreSQL exception", "\\bPSQLException\\b");
+        addErrorSignature(signatures, "MySQL syntax error", "You have an error in your SQL syntax");
+        addErrorSignature(signatures, "SQLite exception", "\\bSQLiteException\\b");
+        addErrorSignature(signatures, "ODBC", "\\bODBC\\b");
+        addErrorSignature(signatures, "PostgreSQL syntax near", "syntax error at or near");
+        addErrorSignature(signatures, "Unterminated quoted string", "unterminated quoted string");
+        addErrorSignature(signatures, "Python traceback", "Traceback \\(most recent call last\\)");
+        addErrorSignature(signatures, "Java stack trace", "\\bat\\s+[\\w.$]+\\([\\w.$]+:\\d+\\)");
+        addErrorSignature(signatures, ".NET exception", "\\bSystem\\.[\\w.]+Exception\\b");
+        addErrorSignature(signatures, "Spring framework", "\\borg\\.springframework\\b");
+        addErrorSignature(signatures, "Go goroutine", "\\bgoroutine\\s+\\d+\\b");
+        addErrorSignature(signatures, "Go panic", "\\bpanic:");
+        addErrorSignature(signatures, "PHP warning", "\\bWarning:\\s");
+        addErrorSignature(signatures, "PHP fatal error", "\\bFatal error\\b");
+        addErrorSignature(signatures, "Uncaught exception", "\\bUncaught\\s");
+        addErrorSignature(signatures, "Internal Server Error", "\\bInternal Server Error\\b");
+        addErrorSignature(signatures, "Stack trace", "\\bstack trace\\b");
+        addErrorSignature(signatures, "Django DEBUG", "\\bDEBUG\\s*=\\s*True\\b");
+        addErrorSignature(signatures, "Laravel Whoops", "Whoops, looks like something went wrong");
+
+        return Collections.unmodifiableMap(signatures);
+    }
+
+    private static void addErrorSignature(Map<String, Pattern> signatures, String name, String regex) {
+        signatures.put(name, Pattern.compile(regex, Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE));
+    }
+
+    static String errorSignatureMatch(String responseBody) {
+        if (responseBody == null || responseBody.isEmpty()) {
+            return "";
+        }
+
+        for (Map.Entry<String, Pattern> signature : ERROR_SIGNATURES.entrySet()) {
+            if (signature.getValue().matcher(responseBody).find()) {
+                return signature.getKey();
+            }
+        }
+
+        return "";
+    }
+
+    private static String exceptionMessage(RuntimeException exception) {
+        String message = exception.getMessage();
+        if (message == null || message.isBlank()) {
+            return exception.getClass().getSimpleName();
+        }
+
+        return message;
     }
 
     private void setStatus(String message) {
@@ -1428,8 +1490,17 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
     private record HeaderBodySplit(byte[] headers, byte[] separator, byte[] body) {
     }
 
-    private record FuzzResult(int entryPoint, String payload, int statusCode, int responseLength, String notes,
-                              HttpRequestResponse requestResponse) {
+    private record FuzzResult(int entryPoint, String payload, int statusCode, int responseLength, String match,
+                              String notes, HttpRequestResponse requestResponse) {
+        private FuzzResult {
+            if (match == null) {
+                match = "";
+            }
+
+            if (notes == null) {
+                notes = "";
+            }
+        }
     }
 
     private enum ResultSignal {
@@ -1556,7 +1627,7 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
 
     private static final class ResultTableModel extends AbstractTableModel {
         private static final long serialVersionUID = 1L;
-        private static final String[] COLUMNS = {"Entry", "Payload", "Status", "Length", "Signal"};
+        private static final String[] COLUMNS = {"Entry", "Payload", "Status", "Length", "Signal", "Match"};
         private static final int MIN_RESULTS_FOR_SIGNAL = 8;
         private static final int MIN_STATUS_GROUP_FOR_LENGTH_SIGNAL = 5;
         private static final double RARE_STATUS_RATIO = 0.05;
@@ -1616,17 +1687,25 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
                 signals.add(ResultSignal.NORMAL);
             }
 
-            if (results.size() < MIN_RESULTS_FOR_SIGNAL) {
-                return;
+            if (results.size() >= MIN_RESULTS_FOR_SIGNAL) {
+                LinkedHashMap<Integer, List<Integer>> rowsByEntry = new LinkedHashMap<>();
+                for (int row = 0; row < results.size(); row++) {
+                    rowsByEntry.computeIfAbsent(results.get(row).entryPoint(), ignored -> new ArrayList<>()).add(row);
+                }
+
+                for (List<Integer> entryRows : rowsByEntry.values()) {
+                    signalEntryRows(entryRows);
+                }
             }
 
-            LinkedHashMap<Integer, List<Integer>> rowsByEntry = new LinkedHashMap<>();
+            applyMatchSignals();
+        }
+
+        private void applyMatchSignals() {
             for (int row = 0; row < results.size(); row++) {
-                rowsByEntry.computeIfAbsent(results.get(row).entryPoint(), ignored -> new ArrayList<>()).add(row);
-            }
-
-            for (List<Integer> entryRows : rowsByEntry.values()) {
-                signalEntryRows(entryRows);
+                if (!results.get(row).match().isBlank()) {
+                    signals.set(row, stronger(signals.get(row), ResultSignal.INTERESTING));
+                }
             }
         }
 
@@ -1777,6 +1856,7 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
                 case 2 -> result.statusCode();
                 case 3 -> result.responseLength();
                 case 4 -> signalAt(rowIndex).toString();
+                case 5 -> result.match();
                 default -> "";
             };
         }

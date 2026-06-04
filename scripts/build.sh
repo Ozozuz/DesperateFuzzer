@@ -8,7 +8,7 @@ JAR="$JAVA_HOME/bin/jar"
 MONTOYA_API="$ROOT_DIR/lib/montoya-api-2026.4.jar"
 MONTOYA_API_URL="https://repo1.maven.org/maven2/net/portswigger/burp/extensions/montoya-api/2026.4/montoya-api-2026.4.jar"
 CLASSES_DIR="$ROOT_DIR/build/classes"
-JAR_PATH="$ROOT_DIR/build/libs/UnusualFuzzer-0.2.0.jar"
+JAR_PATH="$ROOT_DIR/build/libs/DesperateFuzzer-0.2.0.jar"
 
 if [[ ! -x "$JAVAC" ]]; then
     echo "Missing javac: $JAVAC" >&2

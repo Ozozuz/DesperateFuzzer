@@ -1,4 +1,4 @@
-package dev.unusualfuzzer;
+package dev.desperatefuzzer;
 
 import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.core.ByteArray;
@@ -60,16 +60,24 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.function.Consumer;
+import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
 import static burp.api.montoya.http.message.requests.HttpRequest.httpRequest;
 import static burp.api.montoya.http.message.responses.HttpResponse.httpResponse;
 
-final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider {
+final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvider {
     private static final long serialVersionUID = 1L;
     private static final String DEFAULT_REQUEST = "GET /?q=FUZZ HTTP/1.1\r\nHost: example.com\r\n\r\n";
     private static final Pattern CONTENT_LENGTH_PATTERN = Pattern.compile("(?im)^Content-Length:[ \\t]*\\d+[ \\t]*$");
     private static final int MAX_MUTATION_CASES_PER_ENTRY_POINT = 512;
+    private static final int BOUNDARY_MUTATION_QUOTA = 32;
+    private static final int BIT_FLIP_MUTATION_QUOTA = 112;
+    private static final int ARITHMETIC_MUTATION_QUOTA = 80;
+    private static final int INTERESTING_MUTATION_QUOTA = 128;
+    private static final int BLOCK_MUTATION_QUOTA = 96;
+    private static final int HAVOC_MUTATION_QUOTA = 63;
 
     private final MontoyaApi api;
     private final JTextArea requestTextArea;
@@ -91,7 +99,7 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
     private final Set<String> loggedResultSignals;
     private SwingWorker<List<FuzzResult>, FuzzResult> currentWorker;
 
-    UnusualFuzzerTab(MontoyaApi api) {
+    DesperateFuzzerTab(MontoyaApi api) {
         super(new BorderLayout(8, 8));
         this.api = api;
         this.requestTextArea = new JTextArea(DEFAULT_REQUEST);
@@ -346,115 +354,32 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
             return;
         }
 
-        clearResults();
-        runButton.setEnabled(false);
-        mutationButton.setEnabled(false);
-        stopButton.setEnabled(true);
         SpeedProfile speedProfile = (SpeedProfile) speedProfileComboBox.getSelectedItem();
         List<EncodingMode> activePipeline = List.copyOf(encodingPipeline);
-        int valueCount = EncodingMode.valueCount();
-        setStatus("Running " + (entryPoints.size() * valueCount) + " requests");
-        logScanStart("ASCII fuzz", targetService, entryPoints, speedProfile, activePipeline, entryPoints.size() * valueCount);
+        List<AsciiPayload> asciiPayloads = EncodingMode.payloadsToSend();
+        int totalRequests = entryPoints.size() * asciiPayloads.size();
+        Supplier<List<FuzzJob>> jobSupplier = () -> {
+            List<FuzzJob> jobs = new ArrayList<>();
+            List<EntryPoint> sortedEntryPoints = entryPoints.stream()
+                    .sorted(Comparator.comparingInt(EntryPoint::startInclusive))
+                    .toList();
 
-        currentWorker = new SwingWorker<>() {
-            @Override
-            protected List<FuzzResult> doInBackground() {
-                List<FuzzResult> results = new ArrayList<>();
-                List<FuzzJob> jobs = new ArrayList<>();
-                List<EntryPoint> sortedEntryPoints = entryPoints.stream()
-                        .sorted(Comparator.comparingInt(EntryPoint::startInclusive))
-                        .toList();
+            for (int entryPointIndex = 0; entryPointIndex < sortedEntryPoints.size(); entryPointIndex++) {
+                EntryPoint entryPoint = sortedEntryPoints.get(entryPointIndex);
 
-                for (int entryPointIndex = 0; entryPointIndex < sortedEntryPoints.size(); entryPointIndex++) {
-                    if (isCancelled()) {
-                        break;
-                    }
-
-                    EntryPoint entryPoint = sortedEntryPoints.get(entryPointIndex);
-
-                    for (int value : EncodingMode.valuesToSend()) {
-                        byte[] payload = applyEncodingPipeline(value, activePipeline);
-                        String payloadDisplay = EncodingMode.display(value);
-                        byte[] mutated = mutateRequest(rawRequest, entryPoint, payload);
-                        jobs.add(new FuzzJob(entryPointIndex + 1, payloadDisplay, mutated));
-                    }
-                }
-
-                ExecutorService executor = Executors.newFixedThreadPool(speedProfile.threadCount());
-                ExecutorCompletionService<FuzzResult> completionService = new ExecutorCompletionService<>(executor);
-                int submittedJobs = 0;
-
-                try {
-                    for (FuzzJob job : jobs) {
-                        if (isCancelled()) {
-                            break;
-                        }
-
-                        completionService.submit(() -> sendMutatedRequest(targetService, job.request(), job.entryPoint(), job.payload()));
-                        submittedJobs++;
-                    }
-
-                    for (int completedJobs = 0; completedJobs < submittedJobs; completedJobs++) {
-                        if (isCancelled()) {
-                            break;
-                        }
-
-                        Future<FuzzResult> future = completionService.take();
-                        FuzzResult result = future.get();
-                        results.add(result);
-                        publish(result);
-                    }
-                } catch (InterruptedException exception) {
-                    Thread.currentThread().interrupt();
-                } catch (ExecutionException exception) {
-                    api.logging().logToError(exception.toString());
-                } finally {
-                    executor.shutdownNow();
-                }
-
-                return results;
-            }
-
-            @Override
-            protected void process(List<FuzzResult> chunks) {
-                resultTableModel.addAll(chunks);
-                logNewResultSignals();
-                setStatus("Sent " + resultTableModel.getRowCount() + " / " + (entryPoints.size() * valueCount));
-            }
-
-            @Override
-            protected void done() {
-                runButton.setEnabled(true);
-                mutationButton.setEnabled(true);
-                stopButton.setEnabled(false);
-
-                try {
-                    int count = get().size();
-                    if (isCancelled()) {
-                        setStatus("Stopped: " + resultTableModel.getRowCount() + " requests sent");
-                        logToExtension("ASCII fuzz stopped results=" + resultTableModel.getRowCount());
-                    } else {
-                        setStatus("Completed: " + count + " requests sent");
-                        logToExtension("ASCII fuzz completed results=" + count);
-                    }
-                } catch (InterruptedException exception) {
-                    Thread.currentThread().interrupt();
-                    setStatus("Interrupted");
-                    logToExtension("ASCII fuzz interrupted results=" + resultTableModel.getRowCount());
-                } catch (java.util.concurrent.CancellationException exception) {
-                    setStatus("Stopped: " + resultTableModel.getRowCount() + " requests sent");
-                    logToExtension("ASCII fuzz stopped results=" + resultTableModel.getRowCount());
-                } catch (ExecutionException exception) {
-                    api.logging().logToError(exception.toString());
-                    setStatus("Failed: " + exception.getCause().getMessage());
-                    logToExtension("ASCII fuzz failed: " + exception.getCause().getMessage());
-                } finally {
-                    currentWorker = null;
+                for (AsciiPayload asciiPayload : asciiPayloads) {
+                    byte[] payload = applyEncodingPipeline(asciiPayload.payload(), activePipeline);
+                    String payloadDisplay = asciiPayload.label();
+                    byte[] mutated = mutateRequest(rawRequest, entryPoint, payload);
+                    jobs.add(new FuzzJob(entryPointIndex + 1, payloadDisplay, mutated));
                 }
             }
+
+            return jobs;
         };
 
-        currentWorker.execute();
+        runScan("ASCII fuzz", "requests", targetService, totalRequests, speedProfile, activePipeline,
+                entryPoints, jobSupplier);
     }
 
     private void runMutationFuzzer() {
@@ -492,36 +417,44 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
             return;
         }
 
+        SpeedProfile speedProfile = (SpeedProfile) speedProfileComboBox.getSelectedItem();
+        List<EncodingMode> activePipeline = List.copyOf(encodingPipeline);
+        Supplier<List<FuzzJob>> jobSupplier = () -> {
+            List<FuzzJob> jobs = new ArrayList<>();
+
+            for (int entryPointIndex = 0; entryPointIndex < mutationPlan.size(); entryPointIndex++) {
+                EntryPointMutations entryPointMutations = mutationPlan.get(entryPointIndex);
+
+                for (MutationCase mutationCase : entryPointMutations.mutations()) {
+                    byte[] encodedPayload = applyEncodingPipeline(mutationCase.payload(), activePipeline);
+                    String payloadDisplay = mutationCase.label() + " => " + EncodingMode.printablePayload(encodedPayload);
+                    byte[] mutated = mutateRequest(rawRequest, entryPointMutations.entryPoint(), encodedPayload);
+                    jobs.add(new FuzzJob(entryPointIndex + 1, payloadDisplay, mutated));
+                }
+            }
+
+            return jobs;
+        };
+
+        runScan("Mutation fuzz", "mutation requests", targetService, totalRequests, speedProfile,
+                activePipeline, entryPoints, jobSupplier);
+    }
+
+    private void runScan(String scanType, String requestLabel, HttpService targetService, int totalRequests,
+                         SpeedProfile speedProfile, List<EncodingMode> activePipeline,
+                         List<EntryPoint> entryPoints, Supplier<List<FuzzJob>> jobSupplier) {
         clearResults();
         runButton.setEnabled(false);
         mutationButton.setEnabled(false);
         stopButton.setEnabled(true);
-        SpeedProfile speedProfile = (SpeedProfile) speedProfileComboBox.getSelectedItem();
-        List<EncodingMode> activePipeline = List.copyOf(encodingPipeline);
-        setStatus("Running " + totalRequests + " mutation requests");
-        logScanStart("Mutation fuzz", targetService, entryPoints, speedProfile, activePipeline, totalRequests);
+        setStatus("Running " + totalRequests + " " + requestLabel);
+        logScanStart(scanType, targetService, entryPoints, speedProfile, activePipeline, totalRequests);
 
         currentWorker = new SwingWorker<>() {
             @Override
             protected List<FuzzResult> doInBackground() {
                 List<FuzzResult> results = new ArrayList<>();
-                List<FuzzJob> jobs = new ArrayList<>();
-
-                for (int entryPointIndex = 0; entryPointIndex < mutationPlan.size(); entryPointIndex++) {
-                    if (isCancelled()) {
-                        break;
-                    }
-
-                    EntryPointMutations entryPointMutations = mutationPlan.get(entryPointIndex);
-
-                    for (MutationCase mutationCase : entryPointMutations.mutations()) {
-                        byte[] encodedPayload = applyEncodingPipeline(mutationCase.payload(), activePipeline);
-                        String payloadDisplay = mutationCase.label() + " => " + EncodingMode.printablePayload(encodedPayload);
-                        byte[] mutated = mutateRequest(rawRequest, entryPointMutations.entryPoint(), encodedPayload);
-                        jobs.add(new FuzzJob(entryPointIndex + 1, payloadDisplay, mutated));
-                    }
-                }
-
+                List<FuzzJob> jobs = jobSupplier.get();
                 ExecutorService executor = Executors.newFixedThreadPool(speedProfile.threadCount());
                 ExecutorCompletionService<FuzzResult> completionService = new ExecutorCompletionService<>(executor);
                 int submittedJobs = 0;
@@ -559,8 +492,8 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
 
             @Override
             protected void process(List<FuzzResult> chunks) {
-                resultTableModel.addAll(chunks);
-                logNewResultSignals();
+                AddedRows addedRows = resultTableModel.addAll(chunks);
+                logNewResultSignals(addedRows);
                 setStatus("Sent " + resultTableModel.getRowCount() + " / " + totalRequests);
             }
 
@@ -574,22 +507,22 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
                     int count = get().size();
                     if (isCancelled()) {
                         setStatus("Stopped: " + resultTableModel.getRowCount() + " requests sent");
-                        logToExtension("Mutation fuzz stopped results=" + resultTableModel.getRowCount());
+                        logToExtension(scanType + " stopped results=" + resultTableModel.getRowCount());
                     } else {
-                        setStatus("Completed: " + count + " mutation requests sent");
-                        logToExtension("Mutation fuzz completed results=" + count);
+                        setStatus("Completed: " + count + " " + requestLabel + " sent");
+                        logToExtension(scanType + " completed results=" + count);
                     }
                 } catch (InterruptedException exception) {
                     Thread.currentThread().interrupt();
                     setStatus("Interrupted");
-                    logToExtension("Mutation fuzz interrupted results=" + resultTableModel.getRowCount());
+                    logToExtension(scanType + " interrupted results=" + resultTableModel.getRowCount());
                 } catch (java.util.concurrent.CancellationException exception) {
                     setStatus("Stopped: " + resultTableModel.getRowCount() + " requests sent");
-                    logToExtension("Mutation fuzz stopped results=" + resultTableModel.getRowCount());
+                    logToExtension(scanType + " stopped results=" + resultTableModel.getRowCount());
                 } catch (ExecutionException exception) {
                     api.logging().logToError(exception.toString());
                     setStatus("Failed: " + exception.getCause().getMessage());
-                    logToExtension("Mutation fuzz failed: " + exception.getCause().getMessage());
+                    logToExtension(scanType + " failed: " + exception.getCause().getMessage());
                 } finally {
                     currentWorker = null;
                 }
@@ -600,16 +533,25 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
     }
 
     private void stopFuzzer() {
+        cancelActiveScan("Stopping...", "Scan stop requested after " + resultTableModel.getRowCount() + " results");
+    }
+
+    void stopActiveScanForUnload() {
+        cancelActiveScan("Extension unloading: stopping scan...",
+                "Extension unload cancelled active scan after " + resultTableModel.getRowCount() + " results");
+    }
+
+    private void cancelActiveScan(String statusMessage, String logMessage) {
         if (currentWorker != null && !currentWorker.isDone()) {
             currentWorker.cancel(true);
-            setStatus("Stopping...");
-            logToExtension("Scan stop requested after " + resultTableModel.getRowCount() + " results");
+            setStatus(statusMessage);
+            logToExtension(logMessage);
         }
     }
 
     private FuzzResult sendMutatedRequest(HttpService targetService, byte[] mutatedRequest, int entryPoint, String payload) {
         try {
-            HttpRequest request = httpRequest(targetService, ByteArray.byteArray(normalizeAndUpdateContentLength(mutatedRequest)));
+            HttpRequest request = httpRequest(targetService, ByteArray.byteArray(updateContentLength(mutatedRequest)));
             HttpRequestResponse requestResponse = api.http().sendRequest(request);
 
             if (!requestResponse.hasResponse()) {
@@ -620,7 +562,7 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
                     entryPoint,
                     payload,
                     requestResponse.response().statusCode(),
-                    requestResponse.response().toString().length(),
+                    requestResponse.response().body().length(),
                     "",
                     requestResponse
             );
@@ -759,51 +701,13 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
             }
 
             int port = uri.getPort() == -1 ? defaultPort(secure) : uri.getPort();
+            if (port < 1 || port > 65535) {
+                throw new IllegalArgumentException("Invalid target port");
+            }
+
             return new Target(host, port, secure);
         } catch (URISyntaxException exception) {
             throw new IllegalArgumentException("Invalid target. Use https://host[:port] or http://host[:port]");
-        }
-    }
-
-    private HostAndPort parseHostAndPort(String hostHeader, boolean secure) {
-        if (hostHeader.startsWith("[")) {
-            int closingBracketIndex = hostHeader.indexOf(']');
-            if (closingBracketIndex < 0) {
-                throw new IllegalArgumentException("Invalid IPv6 host");
-            }
-
-            String host = hostHeader.substring(1, closingBracketIndex);
-            int port = defaultPort(secure);
-
-            if (hostHeader.length() > closingBracketIndex + 1) {
-                if (hostHeader.charAt(closingBracketIndex + 1) != ':') {
-                    throw new IllegalArgumentException("Invalid host");
-                }
-
-                port = parsePort(hostHeader.substring(closingBracketIndex + 2));
-            }
-
-            return new HostAndPort(host, port);
-        }
-
-        int lastColonIndex = hostHeader.lastIndexOf(':');
-        if (lastColonIndex > -1 && hostHeader.indexOf(':') == lastColonIndex) {
-            return new HostAndPort(hostHeader.substring(0, lastColonIndex), parsePort(hostHeader.substring(lastColonIndex + 1)));
-        }
-
-        return new HostAndPort(hostHeader, defaultPort(secure));
-    }
-
-    private int parsePort(String portText) {
-        try {
-            int port = Integer.parseInt(portText);
-            if (port < 1 || port > 65535) {
-                throw new NumberFormatException();
-            }
-
-            return port;
-        } catch (NumberFormatException exception) {
-            throw new IllegalArgumentException("Invalid target port");
         }
     }
 
@@ -824,19 +728,70 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
     }
 
     private List<MutationCase> generateMutationCases(byte[] seed) {
+        LinkedHashMap<String, MutationCase> selected = new LinkedHashMap<>();
+        List<MutationGroup> groups = List.of(
+                mutationGroup(BOUNDARY_MUTATION_QUOTA, this::addBoundaryMutations),
+                mutationGroup(BIT_FLIP_MUTATION_QUOTA, mutations -> addBitFlipMutations(mutations, seed)),
+                mutationGroup(ARITHMETIC_MUTATION_QUOTA, mutations -> addArithmeticMutations(mutations, seed)),
+                mutationGroup(INTERESTING_MUTATION_QUOTA, mutations -> addInterestingValueMutations(mutations, seed)),
+                mutationGroup(BLOCK_MUTATION_QUOTA, mutations -> addBlockMutations(mutations, seed)),
+                mutationGroup(HAVOC_MUTATION_QUOTA, mutations -> addHavocMutations(mutations, seed))
+        );
+
+        addMutation(selected, "seed/original", seed);
+
+        for (MutationGroup group : groups) {
+            addMutationQuota(selected, group);
+        }
+
+        addRemainingMutations(selected, groups);
+
+        return List.copyOf(selected.values());
+    }
+
+    private MutationGroup mutationGroup(int quota, Consumer<LinkedHashMap<String, MutationCase>> mutationBuilder) {
         LinkedHashMap<String, MutationCase> mutations = new LinkedHashMap<>();
+        mutationBuilder.accept(mutations);
+        return new MutationGroup(quota, List.copyOf(mutations.values()));
+    }
 
-        addMutation(mutations, "seed/original", seed);
-        addBoundaryMutations(mutations);
-        addBitFlipMutations(mutations, seed);
-        addArithmeticMutations(mutations, seed);
-        addInterestingValueMutations(mutations, seed);
-        addBlockMutations(mutations, seed);
-        addHavocMutations(mutations, seed);
+    private void addMutationQuota(LinkedHashMap<String, MutationCase> selected, MutationGroup group) {
+        int added = 0;
 
-        return mutations.values().stream()
-                .limit(MAX_MUTATION_CASES_PER_ENTRY_POINT)
-                .toList();
+        for (MutationCase mutationCase : group.mutations()) {
+            if (selected.size() >= MAX_MUTATION_CASES_PER_ENTRY_POINT || added >= group.quota()) {
+                return;
+            }
+
+            if (addMutation(selected, mutationCase.label(), mutationCase.payload())) {
+                added++;
+            }
+        }
+    }
+
+    private void addRemainingMutations(LinkedHashMap<String, MutationCase> selected, List<MutationGroup> groups) {
+        int[] indexes = new int[groups.size()];
+        boolean advanced;
+
+        do {
+            advanced = false;
+
+            for (int groupIndex = 0; groupIndex < groups.size(); groupIndex++) {
+                if (selected.size() >= MAX_MUTATION_CASES_PER_ENTRY_POINT) {
+                    return;
+                }
+
+                MutationGroup group = groups.get(groupIndex);
+                if (indexes[groupIndex] >= group.mutations().size()) {
+                    continue;
+                }
+
+                MutationCase mutationCase = group.mutations().get(indexes[groupIndex]);
+                indexes[groupIndex]++;
+                advanced = true;
+                addMutation(selected, mutationCase.label(), mutationCase.payload());
+            }
+        } while (advanced);
     }
 
     private void addBoundaryMutations(LinkedHashMap<String, MutationCase> mutations) {
@@ -997,9 +952,14 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
         };
     }
 
-    private void addMutation(LinkedHashMap<String, MutationCase> mutations, String label, byte[] payload) {
+    private boolean addMutation(LinkedHashMap<String, MutationCase> mutations, String label, byte[] payload) {
         String key = Arrays.toString(payload);
-        mutations.putIfAbsent(key, new MutationCase(label, payload));
+        if (mutations.containsKey(key)) {
+            return false;
+        }
+
+        mutations.put(key, new MutationCase(label, payload));
+        return true;
     }
 
     private byte[] ascii(String value) {
@@ -1057,11 +1017,6 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
         return builder.toString();
     }
 
-    private byte[] applyEncodingPipeline(int value, List<EncodingMode> pipeline) {
-        byte[] payload = EncodingMode.PLAIN.encodeInitial(value);
-        return applyEncodingPipeline(payload, pipeline);
-    }
-
     private byte[] applyEncodingPipeline(byte[] payload, List<EncodingMode> pipeline) {
         for (EncodingMode encodingMode : pipeline) {
             payload = encodingMode.apply(payload);
@@ -1070,9 +1025,10 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
         return payload;
     }
 
-    private byte[] mutateRequest(String rawRequest, EntryPoint entryPoint, byte[] payload) {
-        byte[] prefix = rawRequest.substring(0, entryPoint.startInclusive()).getBytes(StandardCharsets.ISO_8859_1);
-        byte[] suffix = rawRequest.substring(entryPoint.endExclusive()).getBytes(StandardCharsets.ISO_8859_1);
+    static byte[] mutateRequest(String rawRequest, EntryPoint entryPoint, byte[] payload) {
+        int bodyStart = bodyStartOffset(rawRequest);
+        byte[] prefix = staticRequestPartBytes(rawRequest, 0, entryPoint.startInclusive(), bodyStart);
+        byte[] suffix = staticRequestPartBytes(rawRequest, entryPoint.endExclusive(), rawRequest.length(), bodyStart);
         byte[] mutated = new byte[prefix.length + payload.length + suffix.length];
 
         System.arraycopy(prefix, 0, mutated, 0, prefix.length);
@@ -1082,25 +1038,66 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
         return mutated;
     }
 
-    private byte[] normalizeAndUpdateContentLength(byte[] rawRequest) {
+    private static byte[] staticRequestPartBytes(String rawRequest, int startInclusive, int endExclusive, int bodyStart) {
+        if (bodyStart < 0 || endExclusive <= bodyStart) {
+            return canonicalizeLineEndings(rawRequest.substring(startInclusive, endExclusive))
+                    .getBytes(StandardCharsets.ISO_8859_1);
+        }
+
+        if (startInclusive >= bodyStart) {
+            return rawRequest.substring(startInclusive, endExclusive).getBytes(StandardCharsets.ISO_8859_1);
+        }
+
+        byte[] headerBytes = canonicalizeLineEndings(rawRequest.substring(startInclusive, bodyStart))
+                .getBytes(StandardCharsets.ISO_8859_1);
+        byte[] bodyBytes = rawRequest.substring(bodyStart, endExclusive).getBytes(StandardCharsets.ISO_8859_1);
+        byte[] output = new byte[headerBytes.length + bodyBytes.length];
+
+        System.arraycopy(headerBytes, 0, output, 0, headerBytes.length);
+        System.arraycopy(bodyBytes, 0, output, headerBytes.length, bodyBytes.length);
+
+        return output;
+    }
+
+    private static int bodyStartOffset(String rawRequest) {
+        int separatorOffset = rawRequest.indexOf("\r\n\r\n");
+        if (separatorOffset >= 0) {
+            return separatorOffset + 4;
+        }
+
+        separatorOffset = rawRequest.indexOf("\n\n");
+        if (separatorOffset >= 0) {
+            return separatorOffset + 2;
+        }
+
+        return -1;
+    }
+
+    private static String canonicalizeLineEndings(String requestPart) {
+        return requestPart
+                .replace("\r\n", "\n")
+                .replace('\r', '\n')
+                .replace("\n", "\r\n");
+    }
+
+    static byte[] updateContentLength(byte[] rawRequest) {
         HeaderBodySplit split = splitHeaderAndBody(rawRequest);
 
         if (split == null) {
             return rawRequest;
         }
 
-        String headers = new String(split.headers(), StandardCharsets.ISO_8859_1)
-                .replace("\r\n", "\n")
-                .replace('\r', '\n')
-                .replace("\n", "\r\n");
+        String headers = new String(split.headers(), StandardCharsets.ISO_8859_1);
 
-        if (CONTENT_LENGTH_PATTERN.matcher(headers).find()) {
-            headers = CONTENT_LENGTH_PATTERN.matcher(headers)
-                    .replaceFirst("Content-Length: " + split.body().length);
+        if (!CONTENT_LENGTH_PATTERN.matcher(headers).find()) {
+            return rawRequest;
         }
 
+        headers = CONTENT_LENGTH_PATTERN.matcher(headers)
+                .replaceFirst("Content-Length: " + split.body().length);
+
         byte[] headerBytes = headers.getBytes(StandardCharsets.ISO_8859_1);
-        byte[] separatorBytes = "\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1);
+        byte[] separatorBytes = split.separator();
         byte[] normalized = new byte[headerBytes.length + separatorBytes.length + split.body().length];
 
         System.arraycopy(headerBytes, 0, normalized, 0, headerBytes.length);
@@ -1110,7 +1107,7 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
         return normalized;
     }
 
-    private HeaderBodySplit splitHeaderAndBody(byte[] rawRequest) {
+    private static HeaderBodySplit splitHeaderAndBody(byte[] rawRequest) {
         int bodyOffset = indexOf(rawRequest, new byte[]{'\r', '\n', '\r', '\n'});
         int separatorLength = 4;
 
@@ -1125,11 +1122,12 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
 
         return new HeaderBodySplit(
                 Arrays.copyOfRange(rawRequest, 0, bodyOffset),
+                Arrays.copyOfRange(rawRequest, bodyOffset, bodyOffset + separatorLength),
                 Arrays.copyOfRange(rawRequest, bodyOffset + separatorLength, rawRequest.length)
         );
     }
 
-    private int indexOf(byte[] source, byte[] search) {
+    private static int indexOf(byte[] source, byte[] search) {
         for (int index = 0; index <= source.length - search.length; index++) {
             boolean match = true;
 
@@ -1193,23 +1191,35 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
         }
     }
 
-    private void logNewResultSignals() {
-        for (int row = 0; row < resultTableModel.getRowCount(); row++) {
-            ResultSignal signal = resultTableModel.signalAt(row);
-            if (signal == ResultSignal.NORMAL) {
-                continue;
-            }
+    private void logNewResultSignals(AddedRows addedRows) {
+        for (int row : addedRows.changedSignalRows()) {
+            logResultSignal(row);
+        }
 
-            FuzzResult result = resultTableModel.resultAt(row);
-            String key = signal + "|" + result.entryPoint() + "|" + result.payload() + "|" + result.statusCode()
-                    + "|" + result.responseLength();
+        for (int row = addedRows.firstInsertedRow(); row < addedRows.lastInsertedExclusive(); row++) {
+            logResultSignal(row);
+        }
+    }
 
-            if (loggedResultSignals.add(key)) {
-                logToExtension(signal + " found entry=" + result.entryPoint()
-                        + " payload=\"" + compactForLog(result.payload()) + "\""
-                        + " status=" + result.statusCode()
-                        + " length=" + result.responseLength());
-            }
+    private void logResultSignal(int row) {
+        if (row < 0 || row >= resultTableModel.getRowCount()) {
+            return;
+        }
+
+        ResultSignal signal = resultTableModel.signalAt(row);
+        if (signal == ResultSignal.NORMAL) {
+            return;
+        }
+
+        FuzzResult result = resultTableModel.resultAt(row);
+        String key = signal + "|" + result.entryPoint() + "|" + result.payload() + "|" + result.statusCode()
+                + "|" + result.responseLength();
+
+        if (loggedResultSignals.add(key)) {
+            logToExtension(signal + " found entry=" + result.entryPoint()
+                    + " payload=\"" + compactForLog(result.payload()) + "\""
+                    + " status=" + result.statusCode()
+                    + " length=" + result.responseLength());
         }
     }
 
@@ -1257,16 +1267,25 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
         SwingUtilities.invokeLater(() -> statusLabel.setText(message));
     }
 
-    private record EntryPoint(int startInclusive, int endExclusive, String selectedText) {
+    record EntryPoint(int startInclusive, int endExclusive, String selectedText) {
     }
 
     private record MutationCase(String label, byte[] payload) {
+    }
+
+    private record MutationGroup(int quota, List<MutationCase> mutations) {
     }
 
     private record EntryPointMutations(EntryPoint entryPoint, List<MutationCase> mutations) {
     }
 
     private record FuzzJob(int entryPoint, String payload, byte[] request) {
+    }
+
+    private record AddedRows(int firstInsertedRow, int lastInsertedExclusive, List<Integer> changedSignalRows) {
+    }
+
+    private record AsciiPayload(String label, byte[] payload) {
     }
 
     private enum SpeedProfile {
@@ -1350,22 +1369,15 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
 
         abstract byte[] apply(byte[] input);
 
-        byte[] encodeInitial(int value) {
-            return new byte[]{(byte) value};
-        }
+        static List<AsciiPayload> payloadsToSend() {
+            List<AsciiPayload> payloads = new ArrayList<>(0x101);
 
-        static int valueCount() {
-            return 0x100;
-        }
-
-        static int[] valuesToSend() {
-            int[] values = new int[valueCount()];
-
-            for (int index = 0; index < values.length; index++) {
-                values[index] = index;
+            for (int value = 0; value < 0x100; value++) {
+                payloads.add(new AsciiPayload(display(value), new byte[]{(byte) value}));
             }
 
-            return values;
+            payloads.add(new AsciiPayload("0x0D0x0A", new byte[]{'\r', '\n'}));
+            return payloads;
         }
 
         static EncodingMode[] selectableModes() {
@@ -1410,13 +1422,10 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
         }
     }
 
-    private record HostAndPort(String host, int port) {
-    }
-
     private record Target(String host, int port, boolean secure) {
     }
 
-    private record HeaderBodySplit(byte[] headers, byte[] body) {
+    private record HeaderBodySplit(byte[] headers, byte[] separator, byte[] body) {
     }
 
     private record FuzzResult(int entryPoint, String payload, int statusCode, int responseLength, String notes,
@@ -1552,20 +1561,32 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
         private static final int MIN_BASELINE_COUNT = 5;
         private static final double BASELINE_RATIO = 0.55;
         private final List<FuzzResult> results = new ArrayList<>();
+        private final List<ResultSignal> signals = new ArrayList<>();
 
-        void addAll(List<FuzzResult> newResults) {
+        AddedRows addAll(List<FuzzResult> newResults) {
             if (newResults.isEmpty()) {
-                return;
+                return new AddedRows(results.size(), results.size(), List.of());
             }
 
             int firstRow = results.size();
+            List<ResultSignal> previousSignals = new ArrayList<>(signals);
             results.addAll(newResults);
-            fireTableDataChanged();
+            recomputeSignals();
+
+            List<Integer> changedSignalRows = changedSignalRows(previousSignals, firstRow);
+            fireTableRowsInserted(firstRow, results.size() - 1);
+
+            if (!changedSignalRows.isEmpty()) {
+                fireTableRowsUpdated(0, firstRow - 1);
+            }
+
+            return new AddedRows(firstRow, results.size(), changedSignalRows);
         }
 
         void clear() {
             int previousSize = results.size();
             results.clear();
+            signals.clear();
 
             if (previousSize > 0) {
                 fireTableRowsDeleted(0, previousSize - 1);
@@ -1577,16 +1598,46 @@ final class UnusualFuzzerTab extends JPanel implements ContextMenuItemsProvider 
         }
 
         ResultSignal signalAt(int row) {
-            if (row < 0 || row >= results.size() || results.size() < MIN_RESULTS_FOR_SIGNAL) {
+            if (row < 0 || row >= signals.size()) {
                 return ResultSignal.NORMAL;
             }
 
+            return signals.get(row);
+        }
+
+        private void recomputeSignals() {
+            signals.clear();
+
+            if (results.size() < MIN_RESULTS_FOR_SIGNAL) {
+                for (int index = 0; index < results.size(); index++) {
+                    signals.add(ResultSignal.NORMAL);
+                }
+                return;
+            }
+
             FuzzResult baseline = baselineResult();
+            for (FuzzResult result : results) {
+                signals.add(signalFor(result, baseline));
+            }
+        }
+
+        private List<Integer> changedSignalRows(List<ResultSignal> previousSignals, int previousSize) {
+            List<Integer> changedRows = new ArrayList<>();
+
+            for (int row = 0; row < previousSize; row++) {
+                if (row >= previousSignals.size() || previousSignals.get(row) != signals.get(row)) {
+                    changedRows.add(row);
+                }
+            }
+
+            return changedRows;
+        }
+
+        private ResultSignal signalFor(FuzzResult result, FuzzResult baseline) {
             if (baseline == null) {
                 return ResultSignal.NORMAL;
             }
 
-            FuzzResult result = results.get(row);
             if (result.statusCode() != baseline.statusCode()) {
                 return ResultSignal.OUTSIDER;
             }

@@ -47,5 +47,5 @@ Requires JDK 17+ and `lib/montoya-api-2026.4.jar`.
 Load this in Burp:
 
 ```text
-build/libs/UnusualFuzzer-0.2.0.jar
+build/libs/DesperateFuzzer-0.2.0.jar
 ```

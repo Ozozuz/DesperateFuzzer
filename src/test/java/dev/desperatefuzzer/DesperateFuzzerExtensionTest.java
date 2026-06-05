@@ -98,6 +98,81 @@ class DesperateFuzzerExtensionTest {
     }
 
     @Test
+    void rareLengthBucketIsSignaledOnLargeBaseline() throws Exception {
+        Object model = newResultTableModel();
+        List<Object> rows = new ArrayList<>();
+
+        for (int index = 0; index < 63; index++) {
+            rows.add(fuzzResult(1, "base" + index, 200, 100_000));
+        }
+        rows.add(fuzzResult(1, "rare-length", 200, 100_300));
+
+        addResults(model, rows);
+
+        assertEquals("", signalAt(model, 0));
+        assertEquals("outsider", signalAt(model, 63));
+    }
+
+    @Test
+    void rareLengthBucketIsSignaledOnTinyBaseline() throws Exception {
+        Object model = newResultTableModel();
+        List<Object> rows = new ArrayList<>();
+
+        for (int index = 0; index < 15; index++) {
+            rows.add(fuzzResult(1, "base" + index, 200, 20));
+        }
+        rows.add(fuzzResult(1, "rare-length", 200, 22));
+
+        addResults(model, rows);
+
+        assertEquals("", signalAt(model, 0));
+        assertEquals("outsider", signalAt(model, 15));
+    }
+
+    @Test
+    void lengthRarityNeedsAStableDominantBucket() throws Exception {
+        Object model = newResultTableModel();
+        List<Object> rows = new ArrayList<>();
+
+        rows.add(fuzzResult(1, "one", 200, 100));
+        rows.add(fuzzResult(1, "two", 200, 100));
+        rows.add(fuzzResult(1, "three", 200, 101));
+        rows.add(fuzzResult(1, "four", 200, 102));
+        rows.add(fuzzResult(1, "five", 200, 103));
+        rows.add(fuzzResult(1, "six", 200, 104));
+        rows.add(fuzzResult(1, "seven", 200, 105));
+        rows.add(fuzzResult(1, "eight", 200, 106));
+
+        addResults(model, rows);
+
+        for (int row = 0; row < rows.size(); row++) {
+            assertEquals("", signalAt(model, row));
+        }
+    }
+
+    @Test
+    void lengthRarityRequiresDominantMajority() throws Exception {
+        Object model = newResultTableModel();
+        List<Object> rows = new ArrayList<>();
+
+        for (int index = 0; index < 4; index++) {
+            rows.add(fuzzResult(1, "base" + index, 200, 100_000));
+        }
+        rows.add(fuzzResult(1, "jitter1", 200, 100_300));
+        rows.add(fuzzResult(1, "jitter2", 200, 100_600));
+        rows.add(fuzzResult(1, "jitter3", 200, 100_900));
+        rows.add(fuzzResult(1, "jitter4", 200, 101_200));
+        rows.add(fuzzResult(1, "jitter5", 200, 101_500));
+        rows.add(fuzzResult(1, "jitter6", 200, 101_800));
+
+        addResults(model, rows);
+
+        for (int row = 0; row < rows.size(); row++) {
+            assertEquals("", signalAt(model, row));
+        }
+    }
+
+    @Test
     void rareStatusIsSignaledWithinEntryPoint() throws Exception {
         Object model = newResultTableModel();
         List<Object> rows = new ArrayList<>();
@@ -111,6 +186,60 @@ class DesperateFuzzerExtensionTest {
 
         assertEquals("", signalAt(model, 0));
         assertEquals("outsider", signalAt(model, 20));
+    }
+
+    @Test
+    void tiedStatusGroupsUseOneDeterministicBaseline() throws Exception {
+        Object model = newResultTableModel();
+        List<Object> rows = new ArrayList<>();
+
+        for (int index = 0; index < 8; index++) {
+            rows.add(fuzzResult(1, "ok" + index, 200, 1000));
+        }
+        for (int index = 0; index < 8; index++) {
+            rows.add(fuzzResult(1, "err" + index, 500, 1000));
+        }
+
+        addResults(model, rows);
+
+        assertEquals("", signalAt(model, 0));
+        assertEquals("interesting", signalAt(model, 8));
+    }
+
+    @Test
+    void statusTiePrefersHttpStatusOverNoResponseSentinel() throws Exception {
+        Object model = newResultTableModel();
+        List<Object> rows = new ArrayList<>();
+
+        for (int index = 0; index < 8; index++) {
+            rows.add(fuzzResult(1, "no-response" + index, 0, 0));
+        }
+        for (int index = 0; index < 8; index++) {
+            rows.add(fuzzResult(1, "ok" + index, 200, 1000));
+        }
+
+        addResults(model, rows);
+
+        assertEquals("interesting", signalAt(model, 0));
+        assertEquals("", signalAt(model, 8));
+    }
+
+    @Test
+    void commonNonBaselineStatusIsStillVisible() throws Exception {
+        Object model = newResultTableModel();
+        List<Object> rows = new ArrayList<>();
+
+        for (int index = 0; index < 12; index++) {
+            rows.add(fuzzResult(1, "ok" + index, 200, 1000));
+        }
+        for (int index = 0; index < 8; index++) {
+            rows.add(fuzzResult(1, "redirect" + index, 302, 1000));
+        }
+
+        addResults(model, rows);
+
+        assertEquals("", signalAt(model, 0));
+        assertEquals("interesting", signalAt(model, 12));
     }
 
     @Test
@@ -128,7 +257,7 @@ class DesperateFuzzerExtensionTest {
 
         addResults(model, rows);
 
-        assertEquals("", signalAt(model, 30));
+        assertEquals("interesting", signalAt(model, 30));
         assertEquals("outsider", signalAt(model, 36));
     }
 
@@ -147,6 +276,24 @@ class DesperateFuzzerExtensionTest {
 
         assertEquals("interesting", signalAt(model, 0));
         assertEquals("Oracle ORA", valueAt(model, 0, 5));
+    }
+
+    @Test
+    void notesAreShownInMatchColumnWhenNoSignatureMatched() throws Exception {
+        Object model = newResultTableModel();
+
+        addResults(model, List.of(fuzzResult(1, "timeout", 0, 0, "", "timeout waiting for response")));
+
+        assertEquals("timeout waiting for response", valueAt(model, 0, 5));
+    }
+
+    @Test
+    void matchTakesPrecedenceOverNotesInMatchColumn() throws Exception {
+        Object model = newResultTableModel();
+
+        addResults(model, List.of(fuzzResult(1, "stack", 500, 1000, "Java stack trace", "timeout")));
+
+        assertEquals("Java stack trace", valueAt(model, 0, 5));
     }
 
     @Test
@@ -179,6 +326,12 @@ class DesperateFuzzerExtensionTest {
 
     private static Object fuzzResult(int entryPoint, String payload, int statusCode, int responseLength, String match)
             throws Exception {
+        return fuzzResult(entryPoint, payload, statusCode, responseLength, match, "");
+    }
+
+    private static Object fuzzResult(int entryPoint, String payload, int statusCode, int responseLength, String match,
+                                     String notes)
+            throws Exception {
         Class<?> resultClass = Class.forName("dev.desperatefuzzer.DesperateFuzzerTab$FuzzResult");
         Constructor<?> constructor = resultClass.getDeclaredConstructor(
                 int.class,
@@ -190,7 +343,7 @@ class DesperateFuzzerExtensionTest {
                 Class.forName("burp.api.montoya.http.message.HttpRequestResponse")
         );
         constructor.setAccessible(true);
-        return constructor.newInstance(entryPoint, payload, statusCode, responseLength, match, "", null);
+        return constructor.newInstance(entryPoint, payload, statusCode, responseLength, match, notes, null);
     }
 
     private static void addResults(Object model, List<Object> rows) throws Exception {

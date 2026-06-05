@@ -1219,14 +1219,15 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
 
         FuzzResult result = resultTableModel.resultAt(row);
         String key = signal + "|" + result.entryPoint() + "|" + result.payload() + "|" + result.statusCode()
-                + "|" + result.responseLength() + "|" + result.match();
+                + "|" + result.responseLength() + "|" + result.match() + "|" + result.notes();
 
         if (loggedResultSignals.add(key)) {
             logToExtension(signal + " found entry=" + result.entryPoint()
                     + " payload=\"" + compactForLog(result.payload()) + "\""
                     + " status=" + result.statusCode()
                     + " length=" + result.responseLength()
-                    + (result.match().isBlank() ? "" : " match=\"" + compactForLog(result.match()) + "\""));
+                    + (result.match().isBlank() ? "" : " match=\"" + compactForLog(result.match()) + "\"")
+                    + (result.notes().isBlank() ? "" : " note=\"" + compactForLog(result.notes()) + "\""));
         }
     }
 
@@ -1636,6 +1637,8 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
         private static final double OUTSIDER_LENGTH_RATIO = 0.35;
         private static final int INTERESTING_LENGTH_MIN_DELTA = 50;
         private static final double INTERESTING_LENGTH_RATIO = 0.15;
+        private static final double LENGTH_RARITY_BUCKET_RATIO = 0.002;
+        private static final double MIN_DOMINANT_LENGTH_BUCKET_RATIO = 0.50;
         private final List<FuzzResult> results = new ArrayList<>();
         private final List<ResultSignal> signals = new ArrayList<>();
 
@@ -1731,22 +1734,44 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
                 rowsByStatus.computeIfAbsent(results.get(row).statusCode(), ignored -> new ArrayList<>()).add(row);
             }
 
-            int dominantStatusCount = 0;
-            for (List<Integer> statusRows : rowsByStatus.values()) {
-                dominantStatusCount = Math.max(dominantStatusCount, statusRows.size());
-            }
+            int baselineStatus = baselineStatus(rowsByStatus);
 
-            for (List<Integer> statusRows : rowsByStatus.values()) {
-                ResultSignal statusSignal = statusSignal(entryRows.size(), statusRows.size(), dominantStatusCount);
+            for (Map.Entry<Integer, List<Integer>> entry : rowsByStatus.entrySet()) {
+                List<Integer> statusRows = entry.getValue();
+                ResultSignal statusSignal = entry.getKey() == baselineStatus
+                        ? ResultSignal.NORMAL
+                        : statusSignal(entryRows.size(), statusRows.size());
                 applyLengthSignals(statusRows, statusSignal);
             }
         }
 
-        private ResultSignal statusSignal(int entryResultCount, int statusResultCount, int dominantStatusCount) {
-            if (statusResultCount == entryResultCount || statusResultCount == dominantStatusCount) {
-                return ResultSignal.NORMAL;
+        private int baselineStatus(LinkedHashMap<Integer, List<Integer>> rowsByStatus) {
+            int baselineStatus = Integer.MAX_VALUE;
+            int baselineCount = -1;
+
+            for (Map.Entry<Integer, List<Integer>> entry : rowsByStatus.entrySet()) {
+                int status = entry.getKey();
+                int count = entry.getValue().size();
+
+                if (count > baselineCount
+                        || (count == baselineCount && statusBaselineRank(status) < statusBaselineRank(baselineStatus))) {
+                    baselineStatus = status;
+                    baselineCount = count;
+                }
             }
 
+            return baselineStatus;
+        }
+
+        private long statusBaselineRank(int status) {
+            if (status > 0) {
+                return status;
+            }
+
+            return Integer.MAX_VALUE - (long) status;
+        }
+
+        private ResultSignal statusSignal(int entryResultCount, int statusResultCount) {
             int outsiderThreshold = Math.max(1, (int) Math.floor(entryResultCount * RARE_STATUS_RATIO));
             int interestingThreshold = Math.max(3, (int) Math.floor(entryResultCount * UNCOMMON_STATUS_RATIO));
 
@@ -1758,7 +1783,7 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
                 return ResultSignal.INTERESTING;
             }
 
-            return ResultSignal.NORMAL;
+            return ResultSignal.INTERESTING;
         }
 
         private void applyLengthSignals(List<Integer> statusRows, ResultSignal statusSignal) {
@@ -1770,11 +1795,68 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
             }
 
             int medianLength = medianLength(statusRows);
+            int bucketWidth = lengthBucketWidth(medianLength);
+            LinkedHashMap<Integer, Integer> bucketCounts = lengthBucketCounts(statusRows, medianLength, bucketWidth);
+            int dominantBucketCount = dominantBucketCount(bucketCounts);
 
             for (int row : statusRows) {
                 ResultSignal lengthSignal = lengthSignal(results.get(row), medianLength);
-                signals.set(row, stronger(statusSignal, lengthSignal));
+                ResultSignal raritySignal = lengthRaritySignal(
+                        statusRows.size(),
+                        bucketCounts.get(lengthBucket(results.get(row).responseLength(), medianLength, bucketWidth)),
+                        dominantBucketCount);
+                signals.set(row, stronger(signals.get(row), stronger(statusSignal, stronger(lengthSignal, raritySignal))));
             }
+        }
+
+        private int lengthBucketWidth(int medianLength) {
+            return Math.max(1, (int) Math.round(medianLength * LENGTH_RARITY_BUCKET_RATIO));
+        }
+
+        private LinkedHashMap<Integer, Integer> lengthBucketCounts(List<Integer> rows, int medianLength, int bucketWidth) {
+            LinkedHashMap<Integer, Integer> bucketCounts = new LinkedHashMap<>();
+
+            for (int row : rows) {
+                int bucket = lengthBucket(results.get(row).responseLength(), medianLength, bucketWidth);
+                bucketCounts.merge(bucket, 1, Integer::sum);
+            }
+
+            return bucketCounts;
+        }
+
+        private int lengthBucket(int responseLength, int medianLength, int bucketWidth) {
+            long medianCenteredLength = (long) responseLength - medianLength + (bucketWidth / 2L);
+            return (int) Math.floorDiv(medianCenteredLength, bucketWidth);
+        }
+
+        private int dominantBucketCount(Map<Integer, Integer> bucketCounts) {
+            int dominantCount = 0;
+
+            for (int count : bucketCounts.values()) {
+                dominantCount = Math.max(dominantCount, count);
+            }
+
+            return dominantCount;
+        }
+
+        private ResultSignal lengthRaritySignal(int groupSize, int bucketCount, int dominantBucketCount) {
+            int outsiderThreshold = Math.max(1, (int) Math.floor(groupSize * RARE_STATUS_RATIO));
+            int interestingThreshold = Math.max(2, (int) Math.floor(groupSize * UNCOMMON_STATUS_RATIO));
+            int stableDominantThreshold = Math.max(1, (int) Math.ceil(groupSize * MIN_DOMINANT_LENGTH_BUCKET_RATIO));
+
+            if (bucketCount == dominantBucketCount || dominantBucketCount < stableDominantThreshold) {
+                return ResultSignal.NORMAL;
+            }
+
+            if (bucketCount <= outsiderThreshold) {
+                return ResultSignal.OUTSIDER;
+            }
+
+            if (bucketCount <= interestingThreshold) {
+                return ResultSignal.INTERESTING;
+            }
+
+            return ResultSignal.NORMAL;
         }
 
         private int medianLength(List<Integer> rows) {
@@ -1794,7 +1876,7 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
         }
 
         private ResultSignal lengthSignal(FuzzResult result, int medianLength) {
-            int distance = Math.abs(result.responseLength() - medianLength);
+            long distance = Math.abs((long) result.responseLength() - medianLength);
             int outsiderThreshold = Math.max(OUTSIDER_LENGTH_MIN_DELTA,
                     (int) Math.round(medianLength * OUTSIDER_LENGTH_RATIO));
             int interestingThreshold = Math.max(INTERESTING_LENGTH_MIN_DELTA,
@@ -1856,7 +1938,7 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
                 case 2 -> result.statusCode();
                 case 3 -> result.responseLength();
                 case 4 -> signalAt(rowIndex).toString();
-                case 5 -> result.match();
+                case 5 -> result.match().isBlank() ? result.notes() : result.match();
                 default -> "";
             };
         }

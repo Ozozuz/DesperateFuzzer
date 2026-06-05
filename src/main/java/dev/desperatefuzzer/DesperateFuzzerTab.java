@@ -50,13 +50,12 @@ import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collections;
 import java.util.Comparator;
-import java.util.HashSet;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Random;
-import java.util.Set;
 import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ExecutionException;
@@ -99,7 +98,7 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
     private final JButton stopButton;
     private final JLabel statusLabel;
     private final List<Object> requestHighlightTags;
-    private final Set<String> loggedResultSignals;
+    private final Map<String, ResultSignal> loggedResultSignals;
     private SwingWorker<List<FuzzResult>, FuzzResult> currentWorker;
 
     DesperateFuzzerTab(MontoyaApi api) {
@@ -121,7 +120,7 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
         this.stopButton = new JButton("Stop");
         this.statusLabel = new JLabel("Select request text, then add at least one entry point");
         this.requestHighlightTags = new ArrayList<>();
-        this.loggedResultSignals = new HashSet<>();
+        this.loggedResultSignals = new HashMap<>();
 
         stopButton.setEnabled(false);
         refreshEncodingPipeline();
@@ -1218,17 +1217,20 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
         }
 
         FuzzResult result = resultTableModel.resultAt(row);
-        String key = signal + "|" + result.entryPoint() + "|" + result.payload() + "|" + result.statusCode()
-                + "|" + result.responseLength() + "|" + result.match() + "|" + result.notes();
+        String key = result.entryPoint() + "|" + result.payload();
+        ResultSignal previousLoggedSignal = loggedResultSignals.getOrDefault(key, ResultSignal.NORMAL);
 
-        if (loggedResultSignals.add(key)) {
-            logToExtension(signal + " found entry=" + result.entryPoint()
-                    + " payload=\"" + compactForLog(result.payload()) + "\""
-                    + " status=" + result.statusCode()
-                    + " length=" + result.responseLength()
-                    + (result.match().isBlank() ? "" : " match=\"" + compactForLog(result.match()) + "\"")
-                    + (result.notes().isBlank() ? "" : " note=\"" + compactForLog(result.notes()) + "\""));
+        if (signal.ordinal() <= previousLoggedSignal.ordinal()) {
+            return;
         }
+
+        loggedResultSignals.put(key, signal);
+        logToExtension(signal + " found entry=" + result.entryPoint()
+                + " payload=\"" + compactForLog(result.payload()) + "\""
+                + " status=" + result.statusCode()
+                + " length=" + result.responseLength()
+                + (result.match().isBlank() ? "" : " match=\"" + compactForLog(result.match()) + "\"")
+                + (result.notes().isBlank() ? "" : " note=\"" + compactForLog(result.notes()) + "\""));
     }
 
     private String targetFromService(HttpService service) {
@@ -1628,7 +1630,7 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
 
     private static final class ResultTableModel extends AbstractTableModel {
         private static final long serialVersionUID = 1L;
-        private static final String[] COLUMNS = {"Entry", "Payload", "Status", "Length", "Signal", "Match"};
+        private static final String[] COLUMNS = {"Entry", "Payload", "Status", "Length", "Signal", "Match / Notes"};
         private static final int MIN_RESULTS_FOR_SIGNAL = 8;
         private static final int MIN_STATUS_GROUP_FOR_LENGTH_SIGNAL = 5;
         private static final double RARE_STATUS_RATIO = 0.05;
@@ -1773,14 +1775,9 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
 
         private ResultSignal statusSignal(int entryResultCount, int statusResultCount) {
             int outsiderThreshold = Math.max(1, (int) Math.floor(entryResultCount * RARE_STATUS_RATIO));
-            int interestingThreshold = Math.max(3, (int) Math.floor(entryResultCount * UNCOMMON_STATUS_RATIO));
 
             if (statusResultCount <= outsiderThreshold) {
                 return ResultSignal.OUTSIDER;
-            }
-
-            if (statusResultCount <= interestingThreshold) {
-                return ResultSignal.INTERESTING;
             }
 
             return ResultSignal.INTERESTING;

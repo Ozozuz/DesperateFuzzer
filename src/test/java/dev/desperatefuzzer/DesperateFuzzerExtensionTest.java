@@ -284,6 +284,7 @@ class DesperateFuzzerExtensionTest {
 
         addResults(model, List.of(fuzzResult(1, "timeout", 0, 0, "", "timeout waiting for response")));
 
+        assertEquals("Match / Notes", columnName(model, 5));
         assertEquals("timeout waiting for response", valueAt(model, 0, 5));
     }
 
@@ -361,5 +362,10 @@ class DesperateFuzzerExtensionTest {
     private static Object valueAt(Object model, int row, int column) throws Exception {
         Method method = model.getClass().getMethod("getValueAt", int.class, int.class);
         return method.invoke(model, row, column);
+    }
+
+    private static String columnName(Object model, int column) throws Exception {
+        Method method = model.getClass().getMethod("getColumnName", int.class);
+        return String.valueOf(method.invoke(model, column));
     }
 }

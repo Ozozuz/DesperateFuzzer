@@ -46,17 +46,6 @@ Aggressive             24         100           400 ms            3000 ms
 
 `Custom` exposes the same four controls in the extension UI. `Balanced` is the default. The results table includes response time, and unusually slow results can be promoted to `interesting` or `outsider` alongside status, length, and error-signature signals.
 
-## WebSocket Fuzzing
-
-There are two ways to prepare a WebSocket run:
-
-1. In Burp's WebSocket history/editor, right-click a message and choose **Send WebSocket message to DesperateFuzzer**. This preserves the original upgrade request, including cookies and custom headers.
-2. Enter a `ws://` or `wss://` target including its path and paste a message manually. The default **Auto** transport detects the scheme and performs the WebSocket upgrade automatically.
-
-Choose a text or binary frame, select bytes in the message, add the entry point, then run ASCII or mutation fuzzing as usual. Each case uses an isolated WebSocket connection so asynchronous messages from concurrent cases cannot be attributed to the wrong payload. The first application message received after sending the case is recorded as its response; the profile timeout handles endpoints that do not reply.
-
-Transport selection follows the target scheme in **Auto** mode: `http://` and `https://` use HTTP, while `ws://` and `wss://` create a WebSocket and issue the upgrade handshake. Explicit HTTP/WebSocket overrides remain available for validation and troubleshooting.
-
 ## Metamorphic Engine
 
 Mutation runs remain deterministic and bounded to 512 unique cases per entry point. In addition to boundary values, byte/bit flips, arithmetic changes, interesting bytes, block operations, and deterministic havoc, the engine now derives structure-aware relations such as:

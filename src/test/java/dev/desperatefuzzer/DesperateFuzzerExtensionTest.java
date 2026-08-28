@@ -1,5 +1,6 @@
 package dev.desperatefuzzer;
 
+import burp.api.montoya.core.ToolType;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Constructor;
@@ -7,17 +8,28 @@ import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Base64;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class DesperateFuzzerExtensionTest {
     @Test
     void extensionCanBeInstantiated() {
         assertNotNull(new DesperateFuzzerExtension());
+    }
+
+    @Test
+    void httpContextMenuSupportsProxyAndRepeater() {
+        assertTrue(DesperateFuzzerTab.supportsHttpContextMenu(ToolType.PROXY));
+        assertTrue(DesperateFuzzerTab.supportsHttpContextMenu(ToolType.REPEATER));
+        assertFalse(DesperateFuzzerTab.supportsHttpContextMenu(ToolType.INTRUDER));
     }
 
     @Test
@@ -79,6 +91,108 @@ class DesperateFuzzerExtensionTest {
         for (int index = 0; index < expectedBody.length; index++) {
             assertEquals(expectedBody[index], updatedRequest[bodyOffset + index]);
         }
+    }
+
+    @Test
+    void webSocketMessageMutationPreservesSurroundingBytes() {
+        String message = "A\nFUZZ\rB";
+        int start = message.indexOf("FUZZ");
+        DesperateFuzzerTab.EntryPoint entryPoint = new DesperateFuzzerTab.EntryPoint(start, start + 4, "FUZZ");
+        byte[] payload = new byte[]{0, '\r', '\n', (byte) 0xFF};
+
+        byte[] mutated = DesperateFuzzerTab.mutateMessage(message, entryPoint, payload);
+        byte[] expected = new byte[]{'A', '\n', 0, '\r', '\n', (byte) 0xFF, '\r', 'B'};
+
+        assertTrue(Arrays.equals(expected, mutated));
+    }
+
+    @Test
+    void transportIsAutomaticallyInferredFromTargetScheme() {
+        assertEquals(DesperateFuzzerTab.TransportMode.HTTP,
+                DesperateFuzzerTab.transportFromScheme("http"));
+        assertEquals(DesperateFuzzerTab.TransportMode.HTTP,
+                DesperateFuzzerTab.transportFromScheme("HTTPS"));
+        assertEquals(DesperateFuzzerTab.TransportMode.WEBSOCKET,
+                DesperateFuzzerTab.transportFromScheme("ws"));
+        assertEquals(DesperateFuzzerTab.TransportMode.WEBSOCKET,
+                DesperateFuzzerTab.transportFromScheme("WSS"));
+        assertThrows(IllegalArgumentException.class,
+                () -> DesperateFuzzerTab.transportFromScheme("ftp"));
+    }
+
+    @Test
+    void speedProfilesAreProfessionalAndConcrete() throws Exception {
+        Class<?> profileClass = Class.forName("dev.desperatefuzzer.DesperateFuzzerTab$SpeedProfile");
+        Object[] profiles = profileClass.getEnumConstants();
+        List<String> names = Arrays.stream(profiles).map(profile -> ((Enum<?>) profile).name()).toList();
+
+        assertEquals(List.of("STEALTH", "CONSERVATIVE", "BALANCED", "FAST", "AGGRESSIVE", "CUSTOM"), names);
+        assertFalse(Arrays.stream(profiles).map(Object::toString)
+                .anyMatch(label -> label.toLowerCase().matches(".*(giuseppe|jacopo|giulio).*")));
+
+        Method settingsMethod = profileClass.getDeclaredMethod("settings");
+        settingsMethod.setAccessible(true);
+        List<Integer> concurrency = new ArrayList<>();
+        for (int index = 0; index < profiles.length - 1; index++) {
+            Object settings = settingsMethod.invoke(profiles[index]);
+            Method maxConcurrency = settings.getClass().getDeclaredMethod("maxConcurrency");
+            maxConcurrency.setAccessible(true);
+            concurrency.add((Integer) maxConcurrency.invoke(settings));
+        }
+        assertEquals(List.of(1, 2, 6, 12, 24), concurrency);
+    }
+
+    @Test
+    void adaptiveControllerBacksOffOnSlowFailures() throws Exception {
+        Class<?> profileClass = Class.forName("dev.desperatefuzzer.DesperateFuzzerTab$SpeedProfile");
+        Object balanced = Arrays.stream(profileClass.getEnumConstants())
+                .filter(profile -> ((Enum<?>) profile).name().equals("BALANCED"))
+                .findFirst()
+                .orElseThrow();
+        Method settingsMethod = profileClass.getDeclaredMethod("settings");
+        settingsMethod.setAccessible(true);
+        Object settings = settingsMethod.invoke(balanced);
+
+        Class<?> controllerClass = Class.forName("dev.desperatefuzzer.DesperateFuzzerTab$AdaptiveRateController");
+        Constructor<?> constructor = controllerClass.getDeclaredConstructor(settings.getClass());
+        constructor.setAccessible(true);
+        Object controller = constructor.newInstance(settings);
+        Method allowedConcurrency = controllerClass.getDeclaredMethod("allowedConcurrency");
+        Method observe = controllerClass.getDeclaredMethod("observe", long.class, boolean.class);
+        allowedConcurrency.setAccessible(true);
+        observe.setAccessible(true);
+
+        assertEquals(6, allowedConcurrency.invoke(controller));
+        for (int index = 0; index < 8; index++) {
+            observe.invoke(controller, 5_000L, false);
+        }
+        assertEquals(1, allowedConcurrency.invoke(controller));
+    }
+
+    @Test
+    void metamorphicEngineIsBoundedUniqueAndStructureAware() {
+        List<DesperateFuzzerTab.MutationCase> numeric =
+                DesperateFuzzerTab.generateMutationCases("41".getBytes(StandardCharsets.ISO_8859_1));
+        Set<String> uniquePayloads = new HashSet<>();
+        for (DesperateFuzzerTab.MutationCase mutation : numeric) {
+            uniquePayloads.add(Base64.getEncoder().encodeToString(mutation.payload()));
+        }
+
+        assertTrue(numeric.size() <= 512);
+        assertEquals(numeric.size(), uniquePayloads.size());
+        assertTrue(numeric.stream().anyMatch(mutation -> mutation.label().equals("struct:number-plus-one")
+                && new String(mutation.payload(), StandardCharsets.ISO_8859_1).equals("42")));
+
+        List<DesperateFuzzerTab.MutationCase> json = DesperateFuzzerTab.generateMutationCases(
+                "{\"id\":1}".getBytes(StandardCharsets.ISO_8859_1));
+        assertTrue(json.stream().anyMatch(mutation -> mutation.label().equals("struct:json-property")
+                && new String(mutation.payload(), StandardCharsets.ISO_8859_1)
+                .contains("\"__desperate_fuzzer\":true")));
+
+        List<DesperateFuzzerTab.MutationCase> replacement = DesperateFuzzerTab.generateMutationCases(
+                "abc".getBytes(StandardCharsets.ISO_8859_1));
+        assertTrue(replacement.stream().anyMatch(mutation -> mutation.label().equals("replace:%00@1")
+                && new String(mutation.payload(), StandardCharsets.ISO_8859_1).equals("a%00c")));
     }
 
     @Test
@@ -313,6 +427,22 @@ class DesperateFuzzerExtensionTest {
         assertEquals("Java stack trace", valueAt(model, 9, 5));
     }
 
+    @Test
+    void slowResponseIsSignaledAndTimingIsExposed() throws Exception {
+        Object model = newResultTableModel();
+        List<Object> rows = new ArrayList<>();
+
+        for (int index = 0; index < 9; index++) {
+            rows.add(withResponseTime(fuzzResult(1, "base" + index, 200, 1000), 100));
+        }
+        rows.add(withResponseTime(fuzzResult(1, "slow", 200, 1000), 1_500));
+        addResults(model, rows);
+
+        assertEquals("outsider", signalAt(model, 9));
+        assertEquals("Time (ms)", columnName(model, 6));
+        assertEquals(1_500L, valueAt(model, 9, 6));
+    }
+
     private static Object newResultTableModel() throws Exception {
         Class<?> modelClass = Class.forName("dev.desperatefuzzer.DesperateFuzzerTab$ResultTableModel");
         Constructor<?> constructor = modelClass.getDeclaredConstructor();
@@ -351,6 +481,12 @@ class DesperateFuzzerExtensionTest {
         Method method = model.getClass().getDeclaredMethod("addAll", List.class);
         method.setAccessible(true);
         method.invoke(model, rows);
+    }
+
+    private static Object withResponseTime(Object result, long responseTimeMs) throws Exception {
+        Method method = result.getClass().getDeclaredMethod("withResponseTime", long.class);
+        method.setAccessible(true);
+        return method.invoke(result, responseTimeMs);
     }
 
     private static String signalAt(Object model, int row) throws Exception {

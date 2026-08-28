@@ -2,15 +2,24 @@ package dev.desperatefuzzer;
 
 import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.core.ByteArray;
+import burp.api.montoya.core.Registration;
 import burp.api.montoya.core.ToolType;
 import burp.api.montoya.http.HttpService;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
 import burp.api.montoya.ui.contextmenu.ContextMenuEvent;
 import burp.api.montoya.ui.contextmenu.ContextMenuItemsProvider;
+import burp.api.montoya.ui.contextmenu.WebSocketContextMenuEvent;
+import burp.api.montoya.ui.contextmenu.WebSocketMessage;
 import burp.api.montoya.ui.editor.EditorOptions;
 import burp.api.montoya.ui.editor.HttpRequestEditor;
 import burp.api.montoya.ui.editor.HttpResponseEditor;
+import burp.api.montoya.ui.editor.WebSocketMessageEditor;
+import burp.api.montoya.websocket.BinaryMessage;
+import burp.api.montoya.websocket.TextMessage;
+import burp.api.montoya.websocket.extension.ExtensionWebSocket;
+import burp.api.montoya.websocket.extension.ExtensionWebSocketCreation;
+import burp.api.montoya.websocket.extension.ExtensionWebSocketMessageHandler;
 
 import javax.swing.BorderFactory;
 import javax.swing.JButton;
@@ -26,6 +35,9 @@ import javax.swing.JTable;
 import javax.swing.JTextArea;
 import javax.swing.JTextField;
 import javax.swing.JMenuItem;
+import javax.swing.JOptionPane;
+import javax.swing.JSpinner;
+import javax.swing.SpinnerNumberModel;
 import javax.swing.ListSelectionModel;
 import javax.swing.SwingUtilities;
 import javax.swing.SwingWorker;
@@ -35,6 +47,8 @@ import javax.swing.table.TableRowSorter;
 import javax.swing.text.BadLocationException;
 import javax.swing.text.DefaultHighlighter;
 import javax.swing.text.Highlighter;
+import javax.swing.event.DocumentEvent;
+import javax.swing.event.DocumentListener;
 import java.awt.BorderLayout;
 import java.awt.Color;
 import java.awt.Component;
@@ -45,6 +59,7 @@ import java.awt.GridLayout;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
@@ -53,14 +68,19 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Random;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
@@ -74,21 +94,31 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
     private static final Pattern CONTENT_LENGTH_PATTERN = Pattern.compile("(?im)^Content-Length:[ \\t]*\\d+[ \\t]*$");
     private static final Map<String, Pattern> ERROR_SIGNATURES = errorSignatures();
     private static final int MAX_MUTATION_CASES_PER_ENTRY_POINT = 512;
-    private static final int BOUNDARY_MUTATION_QUOTA = 32;
-    private static final int BIT_FLIP_MUTATION_QUOTA = 112;
-    private static final int ARITHMETIC_MUTATION_QUOTA = 80;
-    private static final int INTERESTING_MUTATION_QUOTA = 128;
-    private static final int BLOCK_MUTATION_QUOTA = 96;
+    private static final int MAX_MUTATION_SEED_BYTES = 65_536;
+    private static final int MAX_MUTATED_PAYLOAD_BYTES = 131_072;
+    private static final int MAX_ENCODED_PAYLOAD_BYTES = 1_048_576;
+    private static final int BOUNDARY_MUTATION_QUOTA = 40;
+    private static final int STRUCTURAL_MUTATION_QUOTA = 96;
+    private static final int BIT_FLIP_MUTATION_QUOTA = 80;
+    private static final int ARITHMETIC_MUTATION_QUOTA = 64;
+    private static final int INTERESTING_MUTATION_QUOTA = 96;
+    private static final int BLOCK_MUTATION_QUOTA = 72;
     private static final int HAVOC_MUTATION_QUOTA = 63;
 
     private final MontoyaApi api;
     private final JTextArea requestTextArea;
     private final HttpRequestEditor resultRequestViewer;
     private final HttpResponseEditor resultResponseViewer;
+    private final WebSocketMessageEditor webSocketRequestViewer;
+    private final WebSocketMessageEditor webSocketResponseViewer;
+    private final JTabbedPane resultDetailTabs;
     private final EntryPointTableModel entryPointTableModel;
     private final ResultTableModel resultTableModel;
     private final JTextField targetField;
+    private final JComboBox<TransportMode> transportModeComboBox;
+    private final JComboBox<WebSocketFrameType> webSocketFrameTypeComboBox;
     private final JComboBox<SpeedProfile> speedProfileComboBox;
+    private final JButton customSpeedButton;
     private final JComboBox<EncodingMode> encodingModeComboBox;
     private final DefaultListModel<EncodingMode> encodingPipelineModel;
     private final JList<EncodingMode> encodingPipelineList;
@@ -99,6 +129,8 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
     private final JLabel statusLabel;
     private final List<Object> requestHighlightTags;
     private final Map<String, ResultSignal> loggedResultSignals;
+    private SpeedSettings customSpeedSettings;
+    private HttpRequest webSocketUpgradeRequest;
     private SwingWorker<List<FuzzResult>, FuzzResult> currentWorker;
 
     DesperateFuzzerTab(MontoyaApi api) {
@@ -107,10 +139,17 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
         this.requestTextArea = new JTextArea(DEFAULT_REQUEST);
         this.resultRequestViewer = api.userInterface().createHttpRequestEditor(EditorOptions.READ_ONLY);
         this.resultResponseViewer = api.userInterface().createHttpResponseEditor(EditorOptions.READ_ONLY);
+        this.webSocketRequestViewer = api.userInterface().createWebSocketMessageEditor(EditorOptions.READ_ONLY);
+        this.webSocketResponseViewer = api.userInterface().createWebSocketMessageEditor(EditorOptions.READ_ONLY);
+        this.resultDetailTabs = new JTabbedPane();
         this.entryPointTableModel = new EntryPointTableModel();
         this.resultTableModel = new ResultTableModel();
         this.targetField = new JTextField("https://example.com", 34);
+        this.transportModeComboBox = new JComboBox<>(TransportMode.values());
+        this.webSocketFrameTypeComboBox = new JComboBox<>(WebSocketFrameType.values());
         this.speedProfileComboBox = new JComboBox<>(SpeedProfile.values());
+        this.speedProfileComboBox.setSelectedItem(SpeedProfile.BALANCED);
+        this.customSpeedButton = new JButton("Custom settings...");
         this.encodingModeComboBox = new JComboBox<>(EncodingMode.selectableModes());
         this.encodingPipelineModel = new DefaultListModel<>();
         this.encodingPipelineList = new JList<>(encodingPipelineModel);
@@ -118,13 +157,15 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
         this.runButton = new JButton("Run");
         this.mutationButton = new JButton("Run mutations");
         this.stopButton = new JButton("Stop");
-        this.statusLabel = new JLabel("Select request text, then add at least one entry point");
+        this.statusLabel = new JLabel("Select request/message text, then add at least one entry point");
         this.requestHighlightTags = new ArrayList<>();
         this.loggedResultSignals = new HashMap<>();
+        this.customSpeedSettings = SpeedProfile.BALANCED.settings();
 
         stopButton.setEnabled(false);
         refreshEncodingPipeline();
         configureRequestTextArea();
+        configureTransportControls();
 
         setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
         add(buildToolbar(), BorderLayout.NORTH);
@@ -138,6 +179,77 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
         requestTextArea.setTabSize(4);
     }
 
+    private void configureTransportControls() {
+        transportModeComboBox.addActionListener(event -> refreshTransportMode());
+        targetField.getDocument().addDocumentListener(new DocumentListener() {
+            @Override
+            public void insertUpdate(DocumentEvent event) {
+                refreshTransportMode();
+            }
+
+            @Override
+            public void removeUpdate(DocumentEvent event) {
+                refreshTransportMode();
+            }
+
+            @Override
+            public void changedUpdate(DocumentEvent event) {
+                refreshTransportMode();
+            }
+        });
+        speedProfileComboBox.addActionListener(event -> refreshSpeedControls());
+        customSpeedButton.addActionListener(event -> configureCustomSpeed());
+        refreshTransportMode();
+        refreshSpeedControls();
+    }
+
+    private void refreshTransportMode() {
+        TransportMode selected = selectedTransportMode();
+        String target = targetField.getText().trim().toLowerCase(Locale.ROOT);
+        boolean webSocket = selected == TransportMode.WEBSOCKET
+                || (selected == TransportMode.AUTO && (target.startsWith("ws://") || target.startsWith("wss://")));
+        webSocketFrameTypeComboBox.setEnabled(webSocket);
+        webSocketFrameTypeComboBox.setVisible(webSocket);
+    }
+
+    private void refreshSpeedControls() {
+        customSpeedButton.setEnabled(speedProfileComboBox.getSelectedItem() == SpeedProfile.CUSTOM);
+    }
+
+    private void configureCustomSpeed() {
+        JSpinner concurrencySpinner = new JSpinner(new SpinnerNumberModel(
+                customSpeedSettings.maxConcurrency(), 1, 64, 1));
+        JSpinner rateSpinner = new JSpinner(new SpinnerNumberModel(
+                customSpeedSettings.maxRequestsPerSecond(), 0.5, 500.0, 0.5));
+        JSpinner latencySpinner = new JSpinner(new SpinnerNumberModel(
+                customSpeedSettings.targetLatencyMs(), 50, 30_000, 50));
+        JSpinner timeoutSpinner = new JSpinner(new SpinnerNumberModel(
+                customSpeedSettings.responseTimeoutMs(), 250, 60_000, 250));
+        JPanel fields = new JPanel(new GridLayout(4, 2, 8, 6));
+        fields.add(new JLabel("Maximum concurrent requests"));
+        fields.add(concurrencySpinner);
+        fields.add(new JLabel("Maximum requests / second"));
+        fields.add(rateSpinner);
+        fields.add(new JLabel("Target response time (ms)"));
+        fields.add(latencySpinner);
+        fields.add(new JLabel("Response timeout (ms)"));
+        fields.add(timeoutSpinner);
+
+        int choice = JOptionPane.showConfirmDialog(this, fields, "Custom adaptive profile",
+                JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE);
+        if (choice != JOptionPane.OK_OPTION) {
+            return;
+        }
+
+        customSpeedSettings = new SpeedSettings(
+                (Integer) concurrencySpinner.getValue(),
+                ((Number) rateSpinner.getValue()).doubleValue(),
+                (Integer) latencySpinner.getValue(),
+                (Integer) timeoutSpinner.getValue());
+        speedProfileComboBox.repaint();
+        setStatus("Custom profile updated: " + customSpeedSettings.summary());
+    }
+
     private JPanel buildToolbar() {
         JPanel panel = new JPanel(new GridLayout(2, 1, 0, 4));
         JPanel actionRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
@@ -149,6 +261,7 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
         JButton clearEncodingButton = new JButton("Clear encoding");
         JButton clearResultsButton = new JButton("Clear results");
         JLabel targetLabel = new JLabel("Target");
+        JLabel transportLabel = new JLabel("Transport");
         JLabel speedLabel = new JLabel("Profile");
         JLabel encodingLabel = new JLabel("Encoding");
 
@@ -164,10 +277,14 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
 
         actionRow.add(targetLabel);
         actionRow.add(targetField);
+        actionRow.add(transportLabel);
+        actionRow.add(transportModeComboBox);
+        actionRow.add(webSocketFrameTypeComboBox);
         actionRow.add(addEntryPointButton);
         actionRow.add(clearEntryPointsButton);
         actionRow.add(speedLabel);
         actionRow.add(speedProfileComboBox);
+        actionRow.add(customSpeedButton);
         actionRow.add(runButton);
         actionRow.add(mutationButton);
         actionRow.add(stopButton);
@@ -218,8 +335,6 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
 
         JScrollPane entryPointScroll = new JScrollPane(entryPointTable);
         JScrollPane resultScroll = new JScrollPane(resultTable);
-        JTabbedPane resultDetailTabs = new JTabbedPane();
-
         entryPointScroll.setBorder(BorderFactory.createTitledBorder("Entry points"));
         entryPointScroll.setPreferredSize(new Dimension(320, 96));
         entryPointScroll.setMinimumSize(new Dimension(220, 72));
@@ -228,13 +343,15 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
         resultScroll.setMinimumSize(new Dimension(260, 180));
         resultDetailTabs.addTab("Request", resultRequestViewer.uiComponent());
         resultDetailTabs.addTab("Response", resultResponseViewer.uiComponent());
+        resultDetailTabs.addTab("WebSocket sent", webSocketRequestViewer.uiComponent());
+        resultDetailTabs.addTab("WebSocket received", webSocketResponseViewer.uiComponent());
 
         tableSplit.setTopComponent(entryPointScroll);
         tableSplit.setBottomComponent(resultScroll);
         tableSplit.setResizeWeight(0.18);
 
         JScrollPane requestScroll = new JScrollPane(requestTextArea);
-        requestScroll.setBorder(BorderFactory.createTitledBorder("Request"));
+        requestScroll.setBorder(BorderFactory.createTitledBorder("HTTP request / WebSocket message"));
 
         topSplit.setLeftComponent(requestScroll);
         topSplit.setRightComponent(tableSplit);
@@ -340,10 +457,10 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
         }
 
         String rawRequest = requestTextArea.getText();
-        HttpService targetService;
+        ScanContext scanContext;
 
         try {
-            targetService = serviceFromTargetInput();
+            scanContext = scanContext();
         } catch (IllegalArgumentException exception) {
             setStatus(exception.getMessage());
             return;
@@ -356,7 +473,8 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
             return;
         }
 
-        SpeedProfile speedProfile = (SpeedProfile) speedProfileComboBox.getSelectedItem();
+        SpeedProfile speedProfile = selectedSpeedProfile();
+        SpeedSettings speedSettings = selectedSpeedSettings();
         List<EncodingMode> activePipeline = List.copyOf(encodingPipeline);
         List<AsciiPayload> asciiPayloads = EncodingMode.payloadsToSend();
         int totalRequests = entryPoints.size() * asciiPayloads.size();
@@ -372,7 +490,7 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
                 for (AsciiPayload asciiPayload : asciiPayloads) {
                     byte[] payload = applyEncodingPipeline(asciiPayload.payload(), activePipeline);
                     String payloadDisplay = asciiPayload.label();
-                    byte[] mutated = mutateRequest(rawRequest, entryPoint, payload);
+                    byte[] mutated = mutateInput(rawRequest, entryPoint, payload, scanContext.transportMode());
                     jobs.add(new FuzzJob(entryPointIndex + 1, payloadDisplay, mutated));
                 }
             }
@@ -380,7 +498,7 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
             return jobs;
         };
 
-        runScan("ASCII fuzz", "requests", targetService, totalRequests, speedProfile, activePipeline,
+        runScan("ASCII fuzz", "requests", scanContext, totalRequests, speedProfile, speedSettings, activePipeline,
                 entryPoints, jobSupplier);
     }
 
@@ -392,10 +510,10 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
         }
 
         String rawRequest = requestTextArea.getText();
-        HttpService targetService;
+        ScanContext scanContext;
 
         try {
-            targetService = serviceFromTargetInput();
+            scanContext = scanContext();
         } catch (IllegalArgumentException exception) {
             setStatus(exception.getMessage());
             return;
@@ -405,6 +523,14 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
 
         if (invalidEntryPoint.isPresent()) {
             setStatus("Entry point changed or outside current request. Clear and add it again.");
+            return;
+        }
+
+        Optional<EntryPoint> oversizedEntryPoint = entryPoints.stream()
+                .filter(entryPoint -> seedBytes(rawRequest, entryPoint).length > MAX_MUTATION_SEED_BYTES)
+                .findFirst();
+        if (oversizedEntryPoint.isPresent()) {
+            setStatus("Mutation seed is too large (maximum " + MAX_MUTATION_SEED_BYTES + " bytes)");
             return;
         }
 
@@ -419,7 +545,8 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
             return;
         }
 
-        SpeedProfile speedProfile = (SpeedProfile) speedProfileComboBox.getSelectedItem();
+        SpeedProfile speedProfile = selectedSpeedProfile();
+        SpeedSettings speedSettings = selectedSpeedSettings();
         List<EncodingMode> activePipeline = List.copyOf(encodingPipeline);
         Supplier<List<FuzzJob>> jobSupplier = () -> {
             List<FuzzJob> jobs = new ArrayList<>();
@@ -430,7 +557,8 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
                 for (MutationCase mutationCase : entryPointMutations.mutations()) {
                     byte[] encodedPayload = applyEncodingPipeline(mutationCase.payload(), activePipeline);
                     String payloadDisplay = mutationCase.label() + " => " + EncodingMode.printablePayload(encodedPayload);
-                    byte[] mutated = mutateRequest(rawRequest, entryPointMutations.entryPoint(), encodedPayload);
+                    byte[] mutated = mutateInput(rawRequest, entryPointMutations.entryPoint(), encodedPayload,
+                            scanContext.transportMode());
                     jobs.add(new FuzzJob(entryPointIndex + 1, payloadDisplay, mutated));
                 }
             }
@@ -438,48 +566,52 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
             return jobs;
         };
 
-        runScan("Mutation fuzz", "mutation requests", targetService, totalRequests, speedProfile,
+        runScan("Mutation fuzz", "mutation requests", scanContext, totalRequests, speedProfile, speedSettings,
                 activePipeline, entryPoints, jobSupplier);
     }
 
-    private void runScan(String scanType, String requestLabel, HttpService targetService, int totalRequests,
-                         SpeedProfile speedProfile, List<EncodingMode> activePipeline,
+    private void runScan(String scanType, String requestLabel, ScanContext scanContext, int totalRequests,
+                         SpeedProfile speedProfile, SpeedSettings speedSettings, List<EncodingMode> activePipeline,
                          List<EntryPoint> entryPoints, Supplier<List<FuzzJob>> jobSupplier) {
         clearResults();
         runButton.setEnabled(false);
         mutationButton.setEnabled(false);
         stopButton.setEnabled(true);
         setStatus("Running " + totalRequests + " " + requestLabel);
-        logScanStart(scanType, targetService, entryPoints, speedProfile, activePipeline, totalRequests);
+        logScanStart(scanType, scanContext, entryPoints, speedProfile, speedSettings, activePipeline, totalRequests);
 
         currentWorker = new SwingWorker<>() {
             @Override
             protected List<FuzzResult> doInBackground() {
                 List<FuzzResult> results = new ArrayList<>();
                 List<FuzzJob> jobs = jobSupplier.get();
-                ExecutorService executor = Executors.newFixedThreadPool(speedProfile.threadCount());
-                ExecutorCompletionService<FuzzResult> completionService = new ExecutorCompletionService<>(executor);
-                int submittedJobs = 0;
+                ExecutorService executor = Executors.newFixedThreadPool(speedSettings.maxConcurrency());
+                ExecutorCompletionService<TimedFuzzResult> completionService = new ExecutorCompletionService<>(executor);
+                AdaptiveRateController rateController = new AdaptiveRateController(speedSettings);
+                int nextJob = 0;
+                int inFlight = 0;
 
                 try {
-                    for (FuzzJob job : jobs) {
-                        if (isCancelled()) {
+                    while (!isCancelled() && (nextJob < jobs.size() || inFlight > 0)) {
+                        while (nextJob < jobs.size()
+                                && inFlight < rateController.allowedConcurrency()
+                                && !isCancelled()) {
+                            rateController.awaitPermit();
+                            FuzzJob job = jobs.get(nextJob++);
+                            completionService.submit(() -> sendJob(scanContext, job));
+                            inFlight++;
+                        }
+
+                        if (inFlight == 0) {
                             break;
                         }
 
-                        completionService.submit(() -> sendMutatedRequest(targetService, job.request(), job.entryPoint(), job.payload()));
-                        submittedJobs++;
-                    }
-
-                    for (int completedJobs = 0; completedJobs < submittedJobs; completedJobs++) {
-                        if (isCancelled()) {
-                            break;
-                        }
-
-                        Future<FuzzResult> future = completionService.take();
-                        FuzzResult result = future.get();
-                        results.add(result);
-                        publish(result);
+                        Future<TimedFuzzResult> future = completionService.take();
+                        TimedFuzzResult timedResult = future.get();
+                        inFlight--;
+                        rateController.observe(timedResult.elapsedMs(), timedResult.successful());
+                        results.add(timedResult.result());
+                        publish(timedResult.result());
                     }
                 } catch (InterruptedException exception) {
                     Thread.currentThread().interrupt();
@@ -576,9 +708,108 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
         }
     }
 
+    private TimedFuzzResult sendJob(ScanContext scanContext, FuzzJob job) {
+        long startedAt = System.nanoTime();
+        FuzzResult result = scanContext.transportMode() == TransportMode.HTTP
+                ? sendMutatedRequest(scanContext.service(), job.request(), job.entryPoint(), job.payload())
+                : sendWebSocketMessage(scanContext, job.request(), job.entryPoint(), job.payload());
+        long elapsedMs = Math.max(1, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt));
+        boolean successful = result.statusCode() > 0 && result.notes().isBlank();
+        return new TimedFuzzResult(result.withResponseTime(elapsedMs), elapsedMs, successful);
+    }
+
+    private FuzzResult sendWebSocketMessage(ScanContext context, byte[] message, int entryPoint, String payload) {
+        ExtensionWebSocket webSocket = null;
+        Registration messageRegistration = null;
+
+        try {
+            ExtensionWebSocketCreation creation = context.upgradeRequest() == null
+                    ? api.websockets().createWebSocket(context.service(), context.webSocketPath())
+                    : api.websockets().createWebSocket(context.upgradeRequest());
+            if (creation.webSocket().isEmpty()) {
+                String upgradeStatus = "WebSocket upgrade failed: " + creation.status();
+                int responseLength = creation.upgradeResponse().map(response -> response.body().length()).orElse(0);
+                int statusCode = creation.upgradeResponse().map(response -> (int) response.statusCode()).orElse(0);
+                return FuzzResult.webSocket(entryPoint, payload, statusCode, responseLength, "", upgradeStatus,
+                        message, null);
+            }
+
+            webSocket = creation.webSocket().get();
+            CountDownLatch responseArrived = new CountDownLatch(1);
+            AtomicReference<byte[]> responsePayload = new AtomicReference<>();
+            AtomicBoolean responseWasText = new AtomicBoolean(false);
+            AtomicBoolean closed = new AtomicBoolean(false);
+            AtomicBoolean requestSent = new AtomicBoolean(false);
+            messageRegistration = webSocket.registerMessageHandler(new ExtensionWebSocketMessageHandler() {
+                @Override
+                public void textMessageReceived(TextMessage textMessage) {
+                    if (requestSent.get() && responsePayload.compareAndSet(null,
+                            textMessage.payload().getBytes(StandardCharsets.UTF_8))) {
+                        responseWasText.set(true);
+                        responseArrived.countDown();
+                    }
+                }
+
+                @Override
+                public void binaryMessageReceived(BinaryMessage binaryMessage) {
+                    if (requestSent.get()
+                            && responsePayload.compareAndSet(null, binaryMessage.payload().getBytes())) {
+                        responseArrived.countDown();
+                    }
+                }
+
+                @Override
+                public void onClose() {
+                    closed.set(true);
+                    responseArrived.countDown();
+                }
+            });
+
+            if (context.frameType() == WebSocketFrameType.BINARY) {
+                webSocket.sendBinaryMessage(ByteArray.byteArray(message));
+            } else {
+                webSocket.sendTextMessage(new String(message, StandardCharsets.ISO_8859_1));
+            }
+            requestSent.set(true);
+
+            boolean received = responseArrived.await(context.speedSettings().responseTimeoutMs(), TimeUnit.MILLISECONDS);
+            byte[] response = responsePayload.get();
+            if (!received || response == null) {
+                String note = closed.get() ? "WebSocket closed before a response" : "WebSocket response timeout";
+                return FuzzResult.webSocket(entryPoint, payload, 0, 0, "", note, message, null);
+            }
+
+            String responseText = responseWasText.get()
+                    ? new String(response, StandardCharsets.UTF_8)
+                    : new String(response, StandardCharsets.ISO_8859_1);
+            return FuzzResult.webSocket(entryPoint, payload, 101, response.length,
+                    errorSignatureMatch(responseText), "", message, response);
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            return FuzzResult.webSocket(entryPoint, payload, 0, 0, "", "Interrupted", message, null);
+        } catch (RuntimeException exception) {
+            return FuzzResult.webSocket(entryPoint, payload, 0, 0, "", exceptionMessage(exception), message, null);
+        } finally {
+            if (messageRegistration != null && messageRegistration.isRegistered()) {
+                try {
+                    messageRegistration.deregister();
+                } catch (RuntimeException exception) {
+                    api.logging().logToError("Unable to deregister WebSocket handler: " + exceptionMessage(exception));
+                }
+            }
+            if (webSocket != null) {
+                try {
+                    webSocket.close();
+                } catch (RuntimeException exception) {
+                    api.logging().logToError("Unable to close WebSocket: " + exceptionMessage(exception));
+                }
+            }
+        }
+    }
+
     @Override
     public List<Component> provideMenuItems(ContextMenuEvent event) {
-        if (!event.isFromTool(ToolType.REPEATER)) {
+        if (!supportsHttpContextMenu(event.toolType())) {
             return List.of();
         }
 
@@ -588,8 +819,26 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
         }
 
         JMenuItem menuItem = new JMenuItem("Send to DesperateFuzzer");
-        menuItem.addActionListener(action -> loadRequest(request.get()));
+        menuItem.addActionListener(action -> loadRequest(request.get(), event.toolType()));
 
+        return List.of(menuItem);
+    }
+
+    static boolean supportsHttpContextMenu(ToolType toolType) {
+        return toolType == ToolType.REPEATER || toolType == ToolType.PROXY;
+    }
+
+    @Override
+    public List<Component> provideMenuItems(WebSocketContextMenuEvent event) {
+        Optional<WebSocketMessage> message = event.messageEditorWebSocket()
+                .map(editorEvent -> editorEvent.webSocketMessage())
+                .or(() -> event.selectedWebSocketMessages().stream().findFirst());
+        if (message.isEmpty()) {
+            return List.of();
+        }
+
+        JMenuItem menuItem = new JMenuItem("Send WebSocket message to DesperateFuzzer");
+        menuItem.addActionListener(action -> loadWebSocketMessage(message.get()));
         return List.of(menuItem);
     }
 
@@ -606,15 +855,32 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
                 .map(HttpRequestResponse::request);
     }
 
-    private void loadRequest(HttpRequest request) {
+    private void loadRequest(HttpRequest request, ToolType sourceTool) {
         SwingUtilities.invokeLater(() -> {
+            transportModeComboBox.setSelectedItem(TransportMode.AUTO);
+            webSocketUpgradeRequest = null;
             clearRequestEditorHighlights();
             requestTextArea.setText(request.toString());
             requestTextArea.setCaretPosition(0);
             targetField.setText(targetFromRequest(request));
             entryPointTableModel.clear();
             clearResults();
-            setStatus("Loaded request from Repeater");
+            setStatus("Loaded HTTP request from " + sourceTool);
+        });
+    }
+
+    private void loadWebSocketMessage(WebSocketMessage message) {
+        SwingUtilities.invokeLater(() -> {
+            HttpRequest upgradeRequest = message.upgradeRequest();
+            webSocketUpgradeRequest = upgradeRequest;
+            transportModeComboBox.setSelectedItem(TransportMode.AUTO);
+            clearRequestEditorHighlights();
+            requestTextArea.setText(new String(message.payload().getBytes(), StandardCharsets.ISO_8859_1));
+            requestTextArea.setCaretPosition(0);
+            targetField.setText(webSocketTargetFromRequest(upgradeRequest));
+            entryPointTableModel.clear();
+            clearResults();
+            setStatus("Loaded WebSocket message; select bytes to fuzz");
         });
     }
 
@@ -675,30 +941,77 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
         return scheme + "://" + service.host() + ":" + service.port();
     }
 
-    private HttpService serviceFromTargetInput() {
+    private String webSocketTargetFromRequest(HttpRequest request) {
+        HttpService service = request.httpService();
+        String scheme = service.secure() ? "wss" : "ws";
+        int defaultPort = defaultPort(service.secure());
+        String authority = service.port() == defaultPort
+                ? service.host()
+                : service.host() + ":" + service.port();
+        return scheme + "://" + authority + request.path();
+    }
+
+    private ScanContext scanContext() {
         Target target = parseTarget(targetField.getText().trim());
-        return HttpService.httpService(target.host(), target.port(), target.secure());
+        TransportMode transportMode = target.transportMode();
+        HttpService service = HttpService.httpService(target.host(), target.port(), target.secure());
+        HttpRequest upgradeRequest = transportMode == TransportMode.WEBSOCKET
+                && upgradeRequestMatchesTarget(webSocketUpgradeRequest, target)
+                ? webSocketUpgradeRequest
+                : null;
+        WebSocketFrameType frameType = (WebSocketFrameType) webSocketFrameTypeComboBox.getSelectedItem();
+        return new ScanContext(transportMode, service, target.path(), upgradeRequest,
+                frameType == null ? WebSocketFrameType.TEXT : frameType, selectedSpeedSettings());
+    }
+
+    private boolean upgradeRequestMatchesTarget(HttpRequest request, Target target) {
+        if (request == null) {
+            return false;
+        }
+
+        HttpService service = request.httpService();
+        return service.host().equalsIgnoreCase(target.host())
+                && service.port() == target.port()
+                && service.secure() == target.secure()
+                && request.path().equals(target.path());
+    }
+
+    private TransportMode selectedTransportMode() {
+        TransportMode selected = (TransportMode) transportModeComboBox.getSelectedItem();
+        return selected == null ? TransportMode.AUTO : selected;
+    }
+
+    private SpeedProfile selectedSpeedProfile() {
+        SpeedProfile selected = (SpeedProfile) speedProfileComboBox.getSelectedItem();
+        return selected == null ? SpeedProfile.BALANCED : selected;
+    }
+
+    private SpeedSettings selectedSpeedSettings() {
+        SpeedProfile profile = selectedSpeedProfile();
+        return profile == SpeedProfile.CUSTOM ? customSpeedSettings : profile.settings();
     }
 
     private Target parseTarget(String targetText) {
         if (targetText.isBlank()) {
-            throw new IllegalArgumentException("Missing target. Use https://host[:port] or http://host[:port]");
+            throw new IllegalArgumentException(selectedTransportMode() == TransportMode.WEBSOCKET
+                    ? "Missing target. Use wss://host[:port]/path or ws://host[:port]/path"
+                    : "Missing target. Use http(s)://host or ws(s)://host/path");
         }
 
-        String normalizedTarget = targetText.contains("://") ? targetText : "https://" + targetText;
+        String defaultScheme = selectedTransportMode() == TransportMode.WEBSOCKET ? "wss://" : "https://";
+        String normalizedTarget = targetText.contains("://") ? targetText : defaultScheme + targetText;
 
         try {
             URI uri = new URI(normalizedTarget);
             String scheme = uri.getScheme();
-            boolean secure;
-
-            if ("https".equalsIgnoreCase(scheme)) {
-                secure = true;
-            } else if ("http".equalsIgnoreCase(scheme)) {
-                secure = false;
-            } else {
-                throw new IllegalArgumentException("Target scheme must be http or https");
+            TransportMode inferredTransport = transportFromScheme(scheme);
+            TransportMode requestedTransport = selectedTransportMode();
+            if (requestedTransport != TransportMode.AUTO && requestedTransport != inferredTransport) {
+                throw new IllegalArgumentException(requestedTransport == TransportMode.WEBSOCKET
+                        ? "WebSocket override requires a ws or wss target"
+                        : "HTTP override requires an http or https target");
             }
+            boolean secure = "https".equalsIgnoreCase(scheme) || "wss".equalsIgnoreCase(scheme);
 
             String host = uri.getHost();
             if (host == null || host.isBlank()) {
@@ -710,10 +1023,28 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
                 throw new IllegalArgumentException("Invalid target port");
             }
 
-            return new Target(host, port, secure);
+            String path = uri.getRawPath();
+            if (path == null || path.isBlank()) {
+                path = "/";
+            }
+            if (uri.getRawQuery() != null) {
+                path += "?" + uri.getRawQuery();
+            }
+
+            return new Target(host, port, secure, path, inferredTransport);
         } catch (URISyntaxException exception) {
-            throw new IllegalArgumentException("Invalid target. Use https://host[:port] or http://host[:port]");
+            throw new IllegalArgumentException("Invalid target. Use http(s)://host or ws(s)://host/path");
         }
+    }
+
+    static TransportMode transportFromScheme(String scheme) {
+        if ("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme)) {
+            return TransportMode.HTTP;
+        }
+        if ("ws".equalsIgnoreCase(scheme) || "wss".equalsIgnoreCase(scheme)) {
+            return TransportMode.WEBSOCKET;
+        }
+        throw new IllegalArgumentException("Target scheme must be http, https, ws or wss");
     }
 
     private int defaultPort(boolean secure) {
@@ -732,10 +1063,15 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
         return rawRequest.substring(entryPoint.startInclusive(), entryPoint.endExclusive()).getBytes(StandardCharsets.ISO_8859_1);
     }
 
-    private List<MutationCase> generateMutationCases(byte[] seed) {
+    static List<MutationCase> generateMutationCases(byte[] seed) {
+        if (seed.length > MAX_MUTATION_SEED_BYTES) {
+            throw new IllegalArgumentException("Mutation seed exceeds " + MAX_MUTATION_SEED_BYTES + " bytes");
+        }
+
         LinkedHashMap<String, MutationCase> selected = new LinkedHashMap<>();
         List<MutationGroup> groups = List.of(
-                mutationGroup(BOUNDARY_MUTATION_QUOTA, this::addBoundaryMutations),
+                mutationGroup(BOUNDARY_MUTATION_QUOTA, DesperateFuzzerTab::addBoundaryMutations),
+                mutationGroup(STRUCTURAL_MUTATION_QUOTA, mutations -> addStructuralMutations(mutations, seed)),
                 mutationGroup(BIT_FLIP_MUTATION_QUOTA, mutations -> addBitFlipMutations(mutations, seed)),
                 mutationGroup(ARITHMETIC_MUTATION_QUOTA, mutations -> addArithmeticMutations(mutations, seed)),
                 mutationGroup(INTERESTING_MUTATION_QUOTA, mutations -> addInterestingValueMutations(mutations, seed)),
@@ -754,13 +1090,13 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
         return List.copyOf(selected.values());
     }
 
-    private MutationGroup mutationGroup(int quota, Consumer<LinkedHashMap<String, MutationCase>> mutationBuilder) {
+    private static MutationGroup mutationGroup(int quota, Consumer<LinkedHashMap<String, MutationCase>> mutationBuilder) {
         LinkedHashMap<String, MutationCase> mutations = new LinkedHashMap<>();
         mutationBuilder.accept(mutations);
         return new MutationGroup(quota, List.copyOf(mutations.values()));
     }
 
-    private void addMutationQuota(LinkedHashMap<String, MutationCase> selected, MutationGroup group) {
+    private static void addMutationQuota(LinkedHashMap<String, MutationCase> selected, MutationGroup group) {
         int added = 0;
 
         for (MutationCase mutationCase : group.mutations()) {
@@ -774,7 +1110,7 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
         }
     }
 
-    private void addRemainingMutations(LinkedHashMap<String, MutationCase> selected, List<MutationGroup> groups) {
+    private static void addRemainingMutations(LinkedHashMap<String, MutationCase> selected, List<MutationGroup> groups) {
         int[] indexes = new int[groups.size()];
         boolean advanced;
 
@@ -799,7 +1135,7 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
         } while (advanced);
     }
 
-    private void addBoundaryMutations(LinkedHashMap<String, MutationCase> mutations) {
+    private static void addBoundaryMutations(LinkedHashMap<String, MutationCase> mutations) {
         String[] boundaries = {
                 "",
                 "0",
@@ -829,7 +1165,7 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
         }
     }
 
-    private void addBitFlipMutations(LinkedHashMap<String, MutationCase> mutations, byte[] seed) {
+    private static void addBitFlipMutations(LinkedHashMap<String, MutationCase> mutations, byte[] seed) {
         int length = Math.min(seed.length, 32);
 
         for (int index = 0; index < length; index++) {
@@ -845,7 +1181,73 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
         }
     }
 
-    private void addArithmeticMutations(LinkedHashMap<String, MutationCase> mutations, byte[] seed) {
+    private static void addStructuralMutations(LinkedHashMap<String, MutationCase> mutations, byte[] seed) {
+        if (seed.length == 0) {
+            return;
+        }
+
+        String value = new String(seed, StandardCharsets.ISO_8859_1);
+        String trimmed = value.trim();
+        addMutation(mutations, "struct:lowercase",
+                value.toLowerCase(Locale.ROOT).getBytes(StandardCharsets.ISO_8859_1));
+        addMutation(mutations, "struct:uppercase",
+                value.toUpperCase(Locale.ROOT).getBytes(StandardCharsets.ISO_8859_1));
+        addMutation(mutations, "struct:trim", trimmed.getBytes(StandardCharsets.ISO_8859_1));
+        addMutation(mutations, "struct:leading-space", concat(ascii(" "), seed));
+        addMutation(mutations, "struct:trailing-space", concat(seed, ascii(" ")));
+        addMutation(mutations, "struct:leading-tab", concat(ascii("\t"), seed));
+        addMutation(mutations, "struct:trailing-crlf", concat(seed, ascii("\r\n")));
+        addMutation(mutations, "struct:duplicate", concat(seed, seed));
+
+        byte[] reversed = seed.clone();
+        for (int left = 0, right = reversed.length - 1; left < right; left++, right--) {
+            byte temporary = reversed[left];
+            reversed[left] = reversed[right];
+            reversed[right] = temporary;
+        }
+        addMutation(mutations, "struct:reverse", reversed);
+
+        addMutation(mutations, "struct:double-quoted", concat(ascii("\""), seed, ascii("\"")));
+        addMutation(mutations, "struct:single-quoted", concat(ascii("'"), seed, ascii("'")));
+        addMutation(mutations, "struct:array", concat(ascii("["), seed, ascii("]")));
+        addMutation(mutations, "struct:object-value", concat(ascii("{\"value\":"), seed, ascii("}")));
+
+        if (trimmed.length() >= 2 && ((trimmed.startsWith("\"") && trimmed.endsWith("\""))
+                || (trimmed.startsWith("'") && trimmed.endsWith("'")))) {
+            addMutation(mutations, "struct:unquote",
+                    trimmed.substring(1, trimmed.length() - 1).getBytes(StandardCharsets.ISO_8859_1));
+        }
+
+        if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+            String separator = trimmed.length() == 2 ? "" : ",";
+            String withProperty = trimmed.substring(0, trimmed.length() - 1)
+                    + separator + "\"__desperate_fuzzer\":true}";
+            addMutation(mutations, "struct:json-property",
+                    withProperty.getBytes(StandardCharsets.ISO_8859_1));
+        }
+
+        if (trimmed.matches("[+-]?\\d+")) {
+            try {
+                BigInteger number = new BigInteger(trimmed);
+                addMutation(mutations, "struct:number-minus-one", ascii(number.subtract(BigInteger.ONE).toString()));
+                addMutation(mutations, "struct:number-plus-one", ascii(number.add(BigInteger.ONE).toString()));
+                addMutation(mutations, "struct:number-negated", ascii(number.negate().toString()));
+                addMutation(mutations, "struct:number-leading-zero", ascii("0" + trimmed));
+                addMutation(mutations, "struct:number-exp", ascii(trimmed + "e0"));
+            } catch (NumberFormatException ignored) {
+                // The regex and BigInteger parser intentionally form a defensive pair.
+            }
+        }
+
+        if (value.contains("/")) {
+            addMutation(mutations, "struct:path-dot", ascii("./" + value));
+            addMutation(mutations, "struct:path-parent", ascii("../" + value));
+            addMutation(mutations, "struct:path-double-slash", ascii(value.replace("/", "//")));
+            addMutation(mutations, "struct:path-backslash", ascii(value.replace('/', '\\')));
+        }
+    }
+
+    private static void addArithmeticMutations(LinkedHashMap<String, MutationCase> mutations, byte[] seed) {
         int length = Math.min(seed.length, 64);
         int[] deltas = {-35, -16, -1, 1, 16, 35};
 
@@ -860,7 +1262,7 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
         }
     }
 
-    private void addInterestingValueMutations(LinkedHashMap<String, MutationCase> mutations, byte[] seed) {
+    private static void addInterestingValueMutations(LinkedHashMap<String, MutationCase> mutations, byte[] seed) {
         int length = Math.min(seed.length, 64);
         int[] interestingValues = {0x00, 0x01, 0x02, 0x07, 0x08, 0x09, 0x0A, 0x0D, 0x1F, 0x20, 0x22, 0x27, 0x2F, 0x5C, 0x7F, 0x80, 0xFE, 0xFF};
 
@@ -873,7 +1275,7 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
         }
     }
 
-    private void addBlockMutations(LinkedHashMap<String, MutationCase> mutations, byte[] seed) {
+    private static void addBlockMutations(LinkedHashMap<String, MutationCase> mutations, byte[] seed) {
         if (seed.length == 0) {
             return;
         }
@@ -908,12 +1310,18 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
                         token,
                         Arrays.copyOfRange(seed, position, seed.length)
                 ));
-                addMutation(mutations, "replace:" + printableLabel(token) + "@" + position, token);
+                if (position < seed.length) {
+                    addMutation(mutations, "replace:" + printableLabel(token) + "@" + position, concat(
+                            Arrays.copyOfRange(seed, 0, position),
+                            token,
+                            Arrays.copyOfRange(seed, position + 1, seed.length)
+                    ));
+                }
             }
         }
     }
 
-    private void addHavocMutations(LinkedHashMap<String, MutationCase> mutations, byte[] seed) {
+    private static void addHavocMutations(LinkedHashMap<String, MutationCase> mutations, byte[] seed) {
         Random random = new Random(Arrays.hashCode(seed) ^ 0x5F3759DF);
 
         for (int round = 0; round < 128; round++) {
@@ -928,7 +1336,7 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
         }
     }
 
-    private byte[] applyHavocOperation(byte[] input, Random random) {
+    private static byte[] applyHavocOperation(byte[] input, Random random) {
         if (input.length == 0) {
             return new byte[]{(byte) random.nextInt(256)};
         }
@@ -957,8 +1365,12 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
         };
     }
 
-    private boolean addMutation(LinkedHashMap<String, MutationCase> mutations, String label, byte[] payload) {
-        String key = Arrays.toString(payload);
+    private static boolean addMutation(LinkedHashMap<String, MutationCase> mutations, String label, byte[] payload) {
+        if (payload.length > MAX_MUTATED_PAYLOAD_BYTES) {
+            return false;
+        }
+
+        String key = Base64.getEncoder().encodeToString(payload);
         if (mutations.containsKey(key)) {
             return false;
         }
@@ -967,11 +1379,11 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
         return true;
     }
 
-    private byte[] ascii(String value) {
+    private static byte[] ascii(String value) {
         return value.getBytes(StandardCharsets.US_ASCII);
     }
 
-    private byte[] concat(byte[]... arrays) {
+    private static byte[] concat(byte[]... arrays) {
         int size = 0;
         for (byte[] array : arrays) {
             size += array.length;
@@ -988,17 +1400,17 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
         return output;
     }
 
-    private String repeat(char value, int count) {
+    private static String repeat(char value, int count) {
         char[] chars = new char[count];
         Arrays.fill(chars, value);
         return new String(chars);
     }
 
-    private String signed(int value) {
+    private static String signed(int value) {
         return value > 0 ? "+" + value : String.valueOf(value);
     }
 
-    private String printableLabel(byte[] value) {
+    private static String printableLabel(byte[] value) {
         if (value.length == 0) {
             return "<empty>";
         }
@@ -1025,9 +1437,32 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
     private byte[] applyEncodingPipeline(byte[] payload, List<EncodingMode> pipeline) {
         for (EncodingMode encodingMode : pipeline) {
             payload = encodingMode.apply(payload);
+            if (payload.length > MAX_ENCODED_PAYLOAD_BYTES) {
+                throw new IllegalArgumentException("Encoded payload exceeds "
+                        + MAX_ENCODED_PAYLOAD_BYTES + " bytes; shorten the pipeline or seed");
+            }
         }
 
         return payload;
+    }
+
+    private static byte[] mutateInput(String input, EntryPoint entryPoint, byte[] payload,
+                                      TransportMode transportMode) {
+        if (transportMode == TransportMode.HTTP) {
+            return mutateRequest(input, entryPoint, payload);
+        }
+
+        return mutateMessage(input, entryPoint, payload);
+    }
+
+    static byte[] mutateMessage(String input, EntryPoint entryPoint, byte[] payload) {
+        byte[] prefix = input.substring(0, entryPoint.startInclusive()).getBytes(StandardCharsets.ISO_8859_1);
+        byte[] suffix = input.substring(entryPoint.endExclusive()).getBytes(StandardCharsets.ISO_8859_1);
+        byte[] mutated = new byte[prefix.length + payload.length + suffix.length];
+        System.arraycopy(prefix, 0, mutated, 0, prefix.length);
+        System.arraycopy(payload, 0, mutated, prefix.length, payload.length);
+        System.arraycopy(suffix, 0, mutated, prefix.length + payload.length, suffix.length);
+        return mutated;
     }
 
     static byte[] mutateRequest(String rawRequest, EntryPoint entryPoint, byte[] payload) {
@@ -1160,11 +1595,20 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
         int modelRow = resultTable.convertRowIndexToModel(selectedRow);
         FuzzResult result = resultTableModel.resultAt(modelRow);
 
+        if (result.webSocketRequest() != null) {
+            webSocketRequestViewer.setContents(ByteArray.byteArray(result.webSocketRequest()));
+            webSocketResponseViewer.setContents(ByteArray.byteArray(
+                    result.webSocketResponse() == null ? new byte[0] : result.webSocketResponse()));
+            resultDetailTabs.setSelectedIndex(2);
+            return;
+        }
+
         if (result.requestResponse() == null) {
             return;
         }
 
         resultRequestViewer.setRequest(result.requestResponse().request());
+        resultDetailTabs.setSelectedIndex(0);
 
         if (result.requestResponse().hasResponse()) {
             resultResponseViewer.setResponse(result.requestResponse().response());
@@ -1178,12 +1622,21 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
         loggedResultSignals.clear();
         resultRequestViewer.setRequest(HttpRequest.httpRequest(HttpService.httpService("example.com", 80, false), DEFAULT_REQUEST));
         resultResponseViewer.setResponse(httpResponse(""));
+        webSocketRequestViewer.setContents(ByteArray.byteArray(new byte[0]));
+        webSocketResponseViewer.setContents(ByteArray.byteArray(new byte[0]));
+        resultDetailTabs.setSelectedIndex(0);
     }
 
-    private void logScanStart(String scanType, HttpService targetService, List<EntryPoint> entryPoints,
-                              SpeedProfile speedProfile, List<EncodingMode> activePipeline, int totalRequests) {
-        logToExtension(scanType + " started target=" + targetFromService(targetService)
+    private void logScanStart(String scanType, ScanContext scanContext, List<EntryPoint> entryPoints,
+                              SpeedProfile speedProfile, SpeedSettings speedSettings,
+                              List<EncodingMode> activePipeline, int totalRequests) {
+        String target = scanContext.transportMode() == TransportMode.WEBSOCKET
+                ? webSocketTargetFromContext(scanContext)
+                : targetFromService(scanContext.service());
+        logToExtension(scanType + " started target=" + target
+                + " transport=" + scanContext.transportMode()
                 + " profile=\"" + speedProfile + "\""
+                + " adaptive=\"" + speedSettings.summary() + "\""
                 + " encoding=\"" + encodingPipelineLabel(activePipeline) + "\""
                 + " entryPoints=" + entryPoints.size()
                 + " requests=" + totalRequests);
@@ -1242,6 +1695,15 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
         }
 
         return scheme + "://" + service.host() + ":" + service.port();
+    }
+
+    private String webSocketTargetFromContext(ScanContext context) {
+        String scheme = context.service().secure() ? "wss" : "ws";
+        int defaultPort = defaultPort(context.service().secure());
+        String authority = context.service().port() == defaultPort
+                ? context.service().host()
+                : context.service().host() + ":" + context.service().port();
+        return scheme + "://" + authority + context.webSocketPath();
     }
 
     private String encodingPipelineLabel(List<EncodingMode> pipeline) {
@@ -1335,7 +1797,15 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
     record EntryPoint(int startInclusive, int endExclusive, String selectedText) {
     }
 
-    private record MutationCase(String label, byte[] payload) {
+    record MutationCase(String label, byte[] payload) {
+        MutationCase {
+            payload = payload.clone();
+        }
+
+        @Override
+        public byte[] payload() {
+            return payload.clone();
+        }
     }
 
     private record MutationGroup(int quota, List<MutationCase> mutations) {
@@ -1354,20 +1824,117 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
     }
 
     private enum SpeedProfile {
-        GIUSEPPE("giuseppe [2 threads]", 2),
-        JACOPO("jacopo [6 threads]", 6),
-        GIULIO("giulio [10 threads]", 10);
+        STEALTH("Stealth", new SpeedSettings(1, 1.0, 1_200, 10_000)),
+        CONSERVATIVE("Conservative", new SpeedSettings(2, 4.0, 1_000, 8_000)),
+        BALANCED("Balanced", new SpeedSettings(6, 15.0, 800, 6_000)),
+        FAST("Fast", new SpeedSettings(12, 40.0, 600, 5_000)),
+        AGGRESSIVE("Aggressive", new SpeedSettings(24, 100.0, 400, 3_000)),
+        CUSTOM("Custom", null);
 
         private final String label;
-        private final int threadCount;
+        private final SpeedSettings settings;
 
-        SpeedProfile(String label, int threadCount) {
+        SpeedProfile(String label, SpeedSettings settings) {
             this.label = label;
-            this.threadCount = threadCount;
+            this.settings = settings;
         }
 
-        int threadCount() {
-            return threadCount;
+        SpeedSettings settings() {
+            return settings;
+        }
+
+        @Override
+        public String toString() {
+            return settings == null ? label : label + " — " + settings.summary();
+        }
+    }
+
+    private record SpeedSettings(int maxConcurrency, double maxRequestsPerSecond, int targetLatencyMs,
+                                 int responseTimeoutMs) {
+        private SpeedSettings {
+            if (maxConcurrency < 1 || maxRequestsPerSecond <= 0 || targetLatencyMs < 1 || responseTimeoutMs < 1) {
+                throw new IllegalArgumentException("Invalid speed settings");
+            }
+        }
+
+        String summary() {
+            return maxConcurrency + " concurrent, " + formatRate(maxRequestsPerSecond)
+                    + " req/s, " + targetLatencyMs + " ms target";
+        }
+
+        private static String formatRate(double rate) {
+            return rate == Math.rint(rate) ? String.valueOf((int) rate) : String.valueOf(rate);
+        }
+    }
+
+    private static final class AdaptiveRateController {
+        private static final double EWMA_ALPHA = 0.20;
+        private final SpeedSettings settings;
+        private double latencyEwmaMs;
+        private double failureEwma;
+        private long nextPermitNanos;
+
+        private AdaptiveRateController(SpeedSettings settings) {
+            this.settings = settings;
+            this.latencyEwmaMs = settings.targetLatencyMs();
+            this.nextPermitNanos = System.nanoTime();
+        }
+
+        int allowedConcurrency() {
+            double latencyPressure = Math.max(1.0, latencyEwmaMs / settings.targetLatencyMs());
+            double healthFactor = Math.max(0.20, 1.0 - (failureEwma * 0.80));
+            return Math.max(1, Math.min(settings.maxConcurrency(),
+                    (int) Math.floor((settings.maxConcurrency() * healthFactor) / latencyPressure)));
+        }
+
+        void awaitPermit() throws InterruptedException {
+            long now = System.nanoTime();
+            long waitNanos = nextPermitNanos - now;
+            if (waitNanos > 0) {
+                TimeUnit.NANOSECONDS.sleep(waitNanos);
+                now = System.nanoTime();
+            }
+
+            double latencyPressure = Math.max(1.0, latencyEwmaMs / settings.targetLatencyMs());
+            double failurePressure = 1.0 + (failureEwma * 4.0);
+            long intervalNanos = (long) ((1_000_000_000.0 / settings.maxRequestsPerSecond())
+                    * latencyPressure * failurePressure);
+            nextPermitNanos = Math.max(now, nextPermitNanos) + intervalNanos;
+        }
+
+        void observe(long elapsedMs, boolean successful) {
+            latencyEwmaMs = (EWMA_ALPHA * Math.max(1, elapsedMs))
+                    + ((1.0 - EWMA_ALPHA) * latencyEwmaMs);
+            double failed = successful ? 0.0 : 1.0;
+            failureEwma = (EWMA_ALPHA * failed) + ((1.0 - EWMA_ALPHA) * failureEwma);
+        }
+    }
+
+    enum TransportMode {
+        AUTO("Auto (from target)"),
+        HTTP("HTTP"),
+        WEBSOCKET("WebSocket");
+
+        private final String label;
+
+        TransportMode(String label) {
+            this.label = label;
+        }
+
+        @Override
+        public String toString() {
+            return label;
+        }
+    }
+
+    private enum WebSocketFrameType {
+        TEXT("Text frame"),
+        BINARY("Binary frame");
+
+        private final String label;
+
+        WebSocketFrameType(String label) {
+            this.label = label;
         }
 
         @Override
@@ -1487,22 +2054,101 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
         }
     }
 
-    private record Target(String host, int port, boolean secure) {
+    private record Target(String host, int port, boolean secure, String path, TransportMode transportMode) {
     }
 
     private record HeaderBodySplit(byte[] headers, byte[] separator, byte[] body) {
     }
 
-    private record FuzzResult(int entryPoint, String payload, int statusCode, int responseLength, String match,
-                              String notes, HttpRequestResponse requestResponse) {
-        private FuzzResult {
-            if (match == null) {
-                match = "";
-            }
+    private record ScanContext(TransportMode transportMode, HttpService service, String webSocketPath,
+                               HttpRequest upgradeRequest, WebSocketFrameType frameType,
+                               SpeedSettings speedSettings) {
+    }
 
-            if (notes == null) {
-                notes = "";
-            }
+    private record TimedFuzzResult(FuzzResult result, long elapsedMs, boolean successful) {
+    }
+
+    private static final class FuzzResult {
+        private final int entryPoint;
+        private final String payload;
+        private final int statusCode;
+        private final int responseLength;
+        private final String match;
+        private final String notes;
+        private final HttpRequestResponse requestResponse;
+        private final byte[] webSocketRequest;
+        private final byte[] webSocketResponse;
+        private final long responseTimeMs;
+
+        private FuzzResult(int entryPoint, String payload, int statusCode, int responseLength, String match,
+                           String notes, HttpRequestResponse requestResponse) {
+            this(entryPoint, payload, statusCode, responseLength, match, notes, requestResponse, null, null, 0);
+        }
+
+        private FuzzResult(int entryPoint, String payload, int statusCode, int responseLength, String match,
+                           String notes, HttpRequestResponse requestResponse, byte[] webSocketRequest,
+                           byte[] webSocketResponse, long responseTimeMs) {
+            this.entryPoint = entryPoint;
+            this.payload = payload;
+            this.statusCode = statusCode;
+            this.responseLength = responseLength;
+            this.match = match == null ? "" : match;
+            this.notes = notes == null ? "" : notes;
+            this.requestResponse = requestResponse;
+            this.webSocketRequest = webSocketRequest == null ? null : webSocketRequest.clone();
+            this.webSocketResponse = webSocketResponse == null ? null : webSocketResponse.clone();
+            this.responseTimeMs = responseTimeMs;
+        }
+
+        static FuzzResult webSocket(int entryPoint, String payload, int statusCode, int responseLength,
+                                    String match, String notes, byte[] request, byte[] response) {
+            return new FuzzResult(entryPoint, payload, statusCode, responseLength, match, notes, null,
+                    request, response, 0);
+        }
+
+        FuzzResult withResponseTime(long responseTimeMs) {
+            return new FuzzResult(entryPoint, payload, statusCode, responseLength, match, notes, requestResponse,
+                    webSocketRequest, webSocketResponse, responseTimeMs);
+        }
+
+        int entryPoint() {
+            return entryPoint;
+        }
+
+        String payload() {
+            return payload;
+        }
+
+        int statusCode() {
+            return statusCode;
+        }
+
+        int responseLength() {
+            return responseLength;
+        }
+
+        String match() {
+            return match;
+        }
+
+        String notes() {
+            return notes;
+        }
+
+        HttpRequestResponse requestResponse() {
+            return requestResponse;
+        }
+
+        byte[] webSocketRequest() {
+            return webSocketRequest == null ? null : webSocketRequest.clone();
+        }
+
+        byte[] webSocketResponse() {
+            return webSocketResponse == null ? null : webSocketResponse.clone();
+        }
+
+        long responseTimeMs() {
+            return responseTimeMs;
         }
     }
 
@@ -1630,7 +2276,9 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
 
     private static final class ResultTableModel extends AbstractTableModel {
         private static final long serialVersionUID = 1L;
-        private static final String[] COLUMNS = {"Entry", "Payload", "Status", "Length", "Signal", "Match / Notes"};
+        private static final String[] COLUMNS = {
+                "Entry", "Payload", "Status", "Length", "Signal", "Match / Notes", "Time (ms)"
+        };
         private static final int MIN_RESULTS_FOR_SIGNAL = 8;
         private static final int MIN_STATUS_GROUP_FOR_LENGTH_SIGNAL = 5;
         private static final double RARE_STATUS_RATIO = 0.05;
@@ -1641,6 +2289,8 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
         private static final double INTERESTING_LENGTH_RATIO = 0.15;
         private static final double LENGTH_RARITY_BUCKET_RATIO = 0.002;
         private static final double MIN_DOMINANT_LENGTH_BUCKET_RATIO = 0.50;
+        private static final long INTERESTING_TIMING_MIN_DELTA_MS = 300;
+        private static final long OUTSIDER_TIMING_MIN_DELTA_MS = 1_000;
         private final List<FuzzResult> results = new ArrayList<>();
         private final List<ResultSignal> signals = new ArrayList<>();
 
@@ -1792,6 +2442,7 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
             }
 
             int medianLength = medianLength(statusRows);
+            long medianResponseTime = medianResponseTime(statusRows);
             int bucketWidth = lengthBucketWidth(medianLength);
             LinkedHashMap<Integer, Integer> bucketCounts = lengthBucketCounts(statusRows, medianLength, bucketWidth);
             int dominantBucketCount = dominantBucketCount(bucketCounts);
@@ -1802,7 +2453,9 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
                         statusRows.size(),
                         bucketCounts.get(lengthBucket(results.get(row).responseLength(), medianLength, bucketWidth)),
                         dominantBucketCount);
-                signals.set(row, stronger(signals.get(row), stronger(statusSignal, stronger(lengthSignal, raritySignal))));
+                ResultSignal timingSignal = timingSignal(results.get(row), medianResponseTime);
+                signals.set(row, stronger(signals.get(row),
+                        stronger(statusSignal, stronger(lengthSignal, stronger(raritySignal, timingSignal)))));
             }
         }
 
@@ -1872,6 +2525,47 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
             return (int) (((long) lengths.get(middle - 1) + lengths.get(middle)) / 2);
         }
 
+        private long medianResponseTime(List<Integer> rows) {
+            List<Long> timings = new ArrayList<>(rows.size());
+            for (int row : rows) {
+                long responseTime = results.get(row).responseTimeMs();
+                if (responseTime > 0) {
+                    timings.add(responseTime);
+                }
+            }
+
+            if (timings.isEmpty()) {
+                return 0;
+            }
+
+            timings.sort(Long::compareTo);
+            int middle = timings.size() / 2;
+            if (timings.size() % 2 == 1) {
+                return timings.get(middle);
+            }
+
+            return (timings.get(middle - 1) + timings.get(middle)) / 2;
+        }
+
+        private ResultSignal timingSignal(FuzzResult result, long medianResponseTime) {
+            if (result.responseTimeMs() <= 0 || medianResponseTime <= 0) {
+                return ResultSignal.NORMAL;
+            }
+
+            long outsiderThreshold = Math.max(medianResponseTime * 4,
+                    medianResponseTime + OUTSIDER_TIMING_MIN_DELTA_MS);
+            long interestingThreshold = Math.max(medianResponseTime * 2,
+                    medianResponseTime + INTERESTING_TIMING_MIN_DELTA_MS);
+            if (result.responseTimeMs() >= outsiderThreshold) {
+                return ResultSignal.OUTSIDER;
+            }
+            if (result.responseTimeMs() >= interestingThreshold) {
+                return ResultSignal.INTERESTING;
+            }
+
+            return ResultSignal.NORMAL;
+        }
+
         private ResultSignal lengthSignal(FuzzResult result, int medianLength) {
             long distance = Math.abs((long) result.responseLength() - medianLength);
             int outsiderThreshold = Math.max(OUTSIDER_LENGTH_MIN_DELTA,
@@ -1921,6 +2615,7 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
         public Class<?> getColumnClass(int columnIndex) {
             return switch (columnIndex) {
                 case 0, 2, 3 -> Integer.class;
+                case 6 -> Long.class;
                 default -> String.class;
             };
         }
@@ -1936,6 +2631,7 @@ final class DesperateFuzzerTab extends JPanel implements ContextMenuItemsProvide
                 case 3 -> result.responseLength();
                 case 4 -> signalAt(rowIndex).toString();
                 case 5 -> result.match().isBlank() ? result.notes() : result.match();
+                case 6 -> result.responseTimeMs();
                 default -> "";
             };
         }
